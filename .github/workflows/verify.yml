@@ -28,9 +28,14 @@ jobs:
         run: go vet ./...
       - name: Test with shuffled order and coverage
         shell: bash
-        run: mkdir -p artifacts && go test ./... -count=1 -shuffle=on -coverprofile=artifacts/coverage.out
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            ./scripts/verify.sh
+          else
+            mkdir -p artifacts && go test ./... -count=1 -shuffle=on -coverprofile=artifacts/coverage.out
+          fi
       - name: Race detector
-        if: runner.os != 'Windows'
+        if: runner.os == 'macOS'
         run: go test ./... -race -count=1
       - name: Real binary crash durability
         if: runner.os == 'Linux'

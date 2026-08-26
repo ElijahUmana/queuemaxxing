@@ -30,46 +30,44 @@ type config struct {
 }
 
 func main() {
-	cfg := parseConfig()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-
-	handler, err := newHandler(cfg.apiURL, logger)
-	if err != nil {
-		logger.Error("configure workbench", "error", err)
+	if err := run(context.Background(), parseConfig(), logger); err != nil {
+		logger.Error("queue workbench stopped", "error", err)
 		os.Exit(1)
 	}
+}
 
-	server := &http.Server{
-		Addr:              cfg.listenAddress,
-		Handler:           handler,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      65 * time.Second,
-		IdleTimeout:       90 * time.Second,
+func run(parent context.Context, config config, logger *slog.Logger) error {
+	handler, err := newHandler(config.apiURL, logger)
+	if err != nil {
+		return fmt.Errorf("configure workbench: %w", err)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	server := &http.Server{
+		Addr: config.listenAddress, Handler: handler,
+		ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second,
+		WriteTimeout: 65 * time.Second, IdleTimeout: 90 * time.Second,
+	}
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("queue workbench listening", "address", cfg.listenAddress, "api", cfg.apiURL)
+		logger.Info("queue workbench listening", "address", config.listenAddress, "api", config.apiURL)
 		errCh <- server.ListenAndServe()
 	}()
-
 	select {
 	case err := <-errCh:
 		if !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("serve workbench", "error", err)
-			os.Exit(1)
+			return fmt.Errorf("serve workbench: %w", err)
 		}
+		return nil
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			logger.Error("shut down workbench", "error", err)
-			os.Exit(1)
+			_ = server.Close()
+			return fmt.Errorf("shut down workbench: %w", err)
 		}
+		return nil
 	}
 }
 
@@ -99,12 +97,10 @@ func newHandler(apiURL string, logger *slog.Logger) (http.Handler, error) {
 	if upstream.Host == "" || upstream.User != nil || upstream.RawQuery != "" || upstream.Fragment != "" {
 		return nil, fmt.Errorf("API URL must contain only scheme, host, and optional base path")
 	}
-
 	staticFiles, err := fs.Sub(workbenchweb.Static, "static")
 	if err != nil {
 		return nil, fmt.Errorf("open embedded workbench assets: %w", err)
 	}
-
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 	originalDirector := proxy.Director
 	proxy.Director = func(request *http.Request) {
@@ -121,7 +117,6 @@ func newHandler(apiURL string, logger *slog.Logger) (http.Handler, error) {
 		response.WriteHeader(http.StatusBadGateway)
 		_, _ = response.Write([]byte(`{"type":"urn:queuemaxxing:problem:api_unavailable","title":"Queue API unavailable","status":502,"code":"api_unavailable","detail":"The queue API is unavailable.","request_id":""}`))
 	}
-
 	mux := http.NewServeMux()
 	mux.Handle("/api/", proxy)
 	mux.HandleFunc("GET /healthz", func(response http.ResponseWriter, _ *http.Request) {
@@ -142,7 +137,6 @@ func newHandler(apiURL string, logger *slog.Logger) (http.Handler, error) {
 		response.Header().Set("Cache-Control", "no-store")
 		http.ServeFileFS(response, request, staticFiles, "index.html")
 	})
-
 	return securityHeaders(mux), nil
 }
 

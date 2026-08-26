@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,9 +19,18 @@ import (
 
 type fakeService struct {
 	createQueue func(context.Context, model.QueueConfig, string) (model.QueueInfo, bool, error)
+	listQueues  func(context.Context) ([]model.QueueInfo, error)
+	getQueue    func(context.Context, string) (model.QueueInfo, error)
 	enqueue     func(context.Context, string, model.EnqueueRequest) (model.Message, bool, error)
 	receive     func(context.Context, string, model.ReceiveRequest) (*model.Delivery, bool, error)
+	ack         func(context.Context, string, model.AckRequest) (bool, error)
+	nack        func(context.Context, string, model.NackRequest) (model.Message, bool, error)
+	extend      func(context.Context, string, model.ExtendRequest) (model.Delivery, bool, error)
 	list        func(context.Context, string, model.ListFilter) (model.MessagePage, error)
+	dead        func(context.Context, string, model.ListFilter) (model.MessagePage, error)
+	redrive     func(context.Context, string, model.RedriveRequest) (model.RedriveResult, bool, error)
+	stats       func(context.Context) (model.ServiceStats, error)
+	compact     func(context.Context) error
 	ready       error
 }
 
@@ -30,8 +40,16 @@ func (fake *fakeService) CreateQueue(ctx context.Context, config model.QueueConf
 	}
 	return model.QueueInfo{}, false, nil
 }
-func (*fakeService) ListQueues(context.Context) ([]model.QueueInfo, error) { return nil, nil }
-func (*fakeService) GetQueue(context.Context, string) (model.QueueInfo, error) {
+func (fake *fakeService) ListQueues(ctx context.Context) ([]model.QueueInfo, error) {
+	if fake.listQueues != nil {
+		return fake.listQueues(ctx)
+	}
+	return nil, nil
+}
+func (fake *fakeService) GetQueue(ctx context.Context, name string) (model.QueueInfo, error) {
+	if fake.getQueue != nil {
+		return fake.getQueue(ctx, name)
+	}
 	return model.QueueInfo{}, nil
 }
 func (fake *fakeService) Enqueue(ctx context.Context, queue string, request model.EnqueueRequest) (model.Message, bool, error) {
@@ -46,13 +64,22 @@ func (fake *fakeService) Receive(ctx context.Context, queue string, request mode
 	}
 	return nil, false, nil
 }
-func (*fakeService) Ack(context.Context, string, model.AckRequest) (bool, error) {
+func (fake *fakeService) Ack(ctx context.Context, queue string, request model.AckRequest) (bool, error) {
+	if fake.ack != nil {
+		return fake.ack(ctx, queue, request)
+	}
 	return false, nil
 }
-func (*fakeService) Nack(context.Context, string, model.NackRequest) (model.Message, bool, error) {
+func (fake *fakeService) Nack(ctx context.Context, queue string, request model.NackRequest) (model.Message, bool, error) {
+	if fake.nack != nil {
+		return fake.nack(ctx, queue, request)
+	}
 	return model.Message{}, false, nil
 }
-func (*fakeService) Extend(context.Context, string, model.ExtendRequest) (model.Delivery, bool, error) {
+func (fake *fakeService) Extend(ctx context.Context, queue string, request model.ExtendRequest) (model.Delivery, bool, error) {
+	if fake.extend != nil {
+		return fake.extend(ctx, queue, request)
+	}
 	return model.Delivery{}, false, nil
 }
 func (fake *fakeService) ListMessages(ctx context.Context, queue string, filter model.ListFilter) (model.MessagePage, error) {
@@ -61,18 +88,32 @@ func (fake *fakeService) ListMessages(ctx context.Context, queue string, filter 
 	}
 	return model.MessagePage{}, nil
 }
-func (*fakeService) ListDeadLetters(context.Context, string, model.ListFilter) (model.MessagePage, error) {
+func (fake *fakeService) ListDeadLetters(ctx context.Context, queue string, filter model.ListFilter) (model.MessagePage, error) {
+	if fake.dead != nil {
+		return fake.dead(ctx, queue, filter)
+	}
 	return model.MessagePage{}, nil
 }
-func (*fakeService) Redrive(context.Context, string, model.RedriveRequest) (model.RedriveResult, bool, error) {
+func (fake *fakeService) Redrive(ctx context.Context, queue string, request model.RedriveRequest) (model.RedriveResult, bool, error) {
+	if fake.redrive != nil {
+		return fake.redrive(ctx, queue, request)
+	}
 	return model.RedriveResult{}, false, nil
 }
-func (*fakeService) Stats(context.Context) (model.ServiceStats, error) {
+func (fake *fakeService) Stats(ctx context.Context) (model.ServiceStats, error) {
+	if fake.stats != nil {
+		return fake.stats(ctx)
+	}
 	return model.ServiceStats{}, nil
 }
-func (*fakeService) Compact(context.Context) error { return nil }
-func (fake *fakeService) Ready() error             { return fake.ready }
-func (*fakeService) Close(context.Context) error   { return nil }
+func (fake *fakeService) Compact(ctx context.Context) error {
+	if fake.compact != nil {
+		return fake.compact(ctx)
+	}
+	return nil
+}
+func (fake *fakeService) Ready() error           { return fake.ready }
+func (*fakeService) Close(context.Context) error { return nil }
 
 func newTestServer(t *testing.T, service engine.Service, options Options) *Server {
 	t.Helper()
@@ -281,6 +322,11 @@ func TestReadinessAndDraining(t *testing.T) {
 	if response.Code != http.StatusServiceUnavailable || strings.Contains(response.Body.String(), "disk unavailable") {
 		t.Fatalf("readiness response = %d %s", response.Code, response.Body.String())
 	}
+	server = newTestServer(t, &fakeService{}, Options{})
+	response = perform(server, http.MethodGet, "/health/ready", "", "")
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "ready") {
+		t.Fatalf("ready response = %d %s", response.Code, response.Body.String())
+	}
 	server.SetDraining(true)
 	response = perform(server, http.MethodGet, "/v1/stats", "", "")
 	if response.Code != http.StatusServiceUnavailable || decodeProblem(t, response).Code != "draining" {
@@ -308,5 +354,277 @@ func TestUnmatchedRouteReturnsProblemJSON(t *testing.T) {
 	response := perform(server, http.MethodGet, "/v1/missing", "", "")
 	if response.Code != http.StatusNotFound || response.Header().Get("Content-Type") != "application/problem+json" {
 		t.Fatalf("response = %d %+v %s", response.Code, response.Header(), response.Body.String())
+	}
+}
+
+func TestRemainingHandlersTranslateSuccess(t *testing.T) {
+	now := time.Now().UTC()
+	message := model.Message{ID: "m", Queue: "q", Payload: json.RawMessage(`{}`), State: model.StateLeased, LeaseUntil: &now, LastLSN: 9}
+	service := &fakeService{
+		listQueues: func(context.Context) ([]model.QueueInfo, error) {
+			return []model.QueueInfo{{Config: model.QueueConfig{Name: "q", Ordering: model.FIFO, CreatedAt: now}}}, nil
+		},
+		getQueue: func(_ context.Context, name string) (model.QueueInfo, error) {
+			if name != "q" {
+				t.Fatalf("name = %q", name)
+			}
+			return model.QueueInfo{Config: model.QueueConfig{Name: name, Ordering: model.FIFO, CreatedAt: now}}, nil
+		},
+		ack: func(_ context.Context, queue string, request model.AckRequest) (bool, error) {
+			if queue != "q" || request.MessageID != "m" || request.Receipt != "r" || request.IdempotencyKey != "ack-key" {
+				t.Fatalf("ack = %q %+v", queue, request)
+			}
+			return true, nil
+		},
+		nack: func(_ context.Context, queue string, request model.NackRequest) (model.Message, bool, error) {
+			if queue != "q" || request.Delay != time.Second || request.Reason != "retry" {
+				t.Fatalf("nack = %q %+v", queue, request)
+			}
+			copy := message
+			copy.State = model.StateDelayed
+			return copy, true, nil
+		},
+		extend: func(_ context.Context, queue string, request model.ExtendRequest) (model.Delivery, bool, error) {
+			if queue != "q" || request.VisibilityTimeout != 2*time.Second {
+				t.Fatalf("extend = %q %+v", queue, request)
+			}
+			return model.Delivery{Message: message, Receipt: "r", LeaseUntil: now, DeliveryCount: 1}, true, nil
+		},
+		dead: func(_ context.Context, queue string, filter model.ListFilter) (model.MessagePage, error) {
+			if queue != "q" || filter.Limit != 50 {
+				t.Fatalf("dead = %q %+v", queue, filter)
+			}
+			copy := message
+			copy.State = model.StateDead
+			return model.MessagePage{Messages: []model.Message{copy}, SnapshotLSN: 9}, nil
+		},
+		redrive: func(_ context.Context, queue string, request model.RedriveRequest) (model.RedriveResult, bool, error) {
+			if queue != "q" || request.MessageID != "m" || request.IdempotencyKey != "redrive-key" {
+				t.Fatalf("redrive = %q %+v", queue, request)
+			}
+			child := message
+			child.ID = "child"
+			child.ReplayOf = "m"
+			return model.RedriveResult{Source: message, Child: child}, true, nil
+		},
+		stats: func(context.Context) (model.ServiceStats, error) {
+			return model.ServiceStats{Queues: 1, DurableLSN: 9, Messages: model.QueueCounts{InFlight: 1, Total: 1}}, nil
+		},
+		compact: func(context.Context) error { return nil },
+	}
+	server := newTestServer(t, service, Options{})
+	tests := []struct {
+		method, target, body, key string
+		status                    int
+		contains                  string
+	}{
+		{http.MethodGet, "/v1/queues", "", "", 200, `"name":"q"`},
+		{http.MethodGet, "/v1/queues/q", "", "", 200, `"name":"q"`},
+		{http.MethodPost, "/v1/queues/q/messages/m/ack", `{"receipt_handle":"r"}`, "ack-key", 200, `"replayed":true`},
+		{http.MethodPost, "/v1/queues/q/messages/m/nack", `{"receipt_handle":"r","retry_delay_ms":1000,"reason":"retry"}`, "nack-key", 200, `"state":"delayed"`},
+		{http.MethodPost, "/v1/queues/q/messages/m/extend", `{"receipt_handle":"r","visibility_timeout_ms":2000}`, "extend-key", 200, `"receipt_handle":"r"`},
+		{http.MethodGet, "/v1/queues/q/dead-letters", "", "", 200, `"state":"dead"`},
+		{http.MethodPost, "/v1/queues/q/dead-letters/m/redrive", `{}`, "redrive-key", 200, `"replay_of":"m"`},
+		{http.MethodGet, "/v1/stats", "", "", 200, `"durable_lsn":"9"`},
+		{http.MethodPost, "/v1/admin/compact", `{}`, "", 200, `"compacted"`},
+	}
+	for _, test := range tests {
+		request := httptest.NewRequest(test.method, test.target, strings.NewReader(test.body))
+		if test.body != "" {
+			request.Header.Set("Content-Type", "application/json")
+		}
+		if test.key != "" {
+			request.Header.Set("Idempotency-Key", test.key)
+		}
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		if response.Code != test.status || !strings.Contains(response.Body.String(), test.contains) {
+			t.Fatalf("%s %s = %d %s", test.method, test.target, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestHandlerValidationAndInternalErrors(t *testing.T) {
+	service := &fakeService{
+		listQueues: func(context.Context) ([]model.QueueInfo, error) { return nil, errors.New("failed") },
+		getQueue:   func(context.Context, string) (model.QueueInfo, error) { return model.QueueInfo{}, errors.New("failed") },
+		ack:        func(context.Context, string, model.AckRequest) (bool, error) { return false, errors.New("failed") },
+		nack: func(context.Context, string, model.NackRequest) (model.Message, bool, error) {
+			return model.Message{}, false, errors.New("failed")
+		},
+		extend: func(context.Context, string, model.ExtendRequest) (model.Delivery, bool, error) {
+			return model.Delivery{}, false, errors.New("failed")
+		},
+		dead: func(context.Context, string, model.ListFilter) (model.MessagePage, error) {
+			return model.MessagePage{}, errors.New("failed")
+		},
+		redrive: func(context.Context, string, model.RedriveRequest) (model.RedriveResult, bool, error) {
+			return model.RedriveResult{}, false, errors.New("failed")
+		},
+		stats:   func(context.Context) (model.ServiceStats, error) { return model.ServiceStats{}, errors.New("failed") },
+		compact: func(context.Context) error { return errors.New("failed") },
+	}
+	server := newTestServer(t, service, Options{})
+	for _, test := range []struct {
+		method, target, body, contentType string
+		status                            int
+	}{
+		{http.MethodGet, "/v1/queues?unknown=1", "", "", 400},
+		{http.MethodGet, "/v1/queues", "", "", 500},
+		{http.MethodGet, "/v1/queues/q", "", "", 500},
+		{http.MethodPost, "/v1/queues/q/messages/m/ack", `{}`, "application/json", 422},
+		{http.MethodPost, "/v1/queues/q/messages/m/ack", `{"receipt_handle":"r"}`, "application/json", 500},
+		{http.MethodPost, "/v1/queues/q/messages/m/nack", `{"receipt_handle":"r","retry_delay_ms":-1}`, "application/json", 422},
+		{http.MethodPost, "/v1/queues/q/messages/m/nack", `{"receipt_handle":"r","retry_delay_ms":0}`, "application/json", 500},
+		{http.MethodPost, "/v1/queues/q/messages/m/extend", `{"receipt_handle":"r","visibility_timeout_ms":0}`, "application/json", 422},
+		{http.MethodPost, "/v1/queues/q/messages/m/extend", `{"receipt_handle":"r","visibility_timeout_ms":1}`, "application/json", 500},
+		{http.MethodGet, "/v1/queues/q/dead-letters", "", "", 500},
+		{http.MethodPost, "/v1/queues/q/dead-letters/m/redrive", `{}`, "application/json", 400},
+		{http.MethodGet, "/v1/stats", "", "", 500},
+		{http.MethodPost, "/v1/admin/compact?bad=1", `{}`, "application/json", 400},
+		{http.MethodPost, "/v1/admin/compact", `{}`, "application/json", 500},
+	} {
+		response := perform(server, test.method, test.target, test.body, test.contentType)
+		if response.Code != test.status {
+			t.Fatalf("%s %s = %d %s, want %d", test.method, test.target, response.Code, response.Body.String(), test.status)
+		}
+	}
+}
+
+func TestServerConstructionParserAndIdempotencyEdges(t *testing.T) {
+	if _, err := New(nil, Options{}); err == nil {
+		t.Fatal("nil service accepted")
+	}
+	if _, err := New(&fakeService{}, Options{MaxRequestBytes: -1}); err == nil {
+		t.Fatal("negative request limit accepted")
+	}
+	if _, err := New(&fakeService{}, Options{RequestTimeout: -1}); err == nil {
+		t.Fatal("negative timeout accepted")
+	}
+
+	server := newTestServer(t, &fakeService{}, Options{})
+	for _, body := range []string{
+		`{"payload":{"nested":{"a":1,"a":2}}}`,
+		`{"payload":[{"a":1,"a":2}]}`,
+		`{"payload":`,
+		`{"payload":{}} trailing`,
+		`{"payload":null}`,
+	} {
+		response := perform(server, http.MethodPost, "/v1/queues/q/messages", body, "application/json")
+		if response.Code != http.StatusBadRequest && response.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("body %q = %d %s", body, response.Code, response.Body.String())
+		}
+	}
+	for _, values := range [][]string{{"a", "b"}, {" spaced "}, {"line\nbreak"}, {strings.Repeat("x", 257)}} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/queues/q/messages", strings.NewReader(`{"payload":{}}`))
+		request.Header.Set("Content-Type", "application/json")
+		for _, value := range values {
+			request.Header.Add("Idempotency-Key", value)
+		}
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("keys %q = %d %s", values, response.Code, response.Body.String())
+		}
+	}
+	request := httptest.NewRequest(http.MethodGet, "/health/live", nil)
+	request.Header.Set("X-Request-ID", " invalid ")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("X-Request-ID") == " invalid " {
+		t.Fatalf("request ID response = %+v", response.Header())
+	}
+}
+
+func TestServiceProblemContextAndCompactionConflict(t *testing.T) {
+	server := newTestServer(t, &fakeService{enqueue: func(context.Context, string, model.EnqueueRequest) (model.Message, bool, error) {
+		return model.Message{}, false, context.DeadlineExceeded
+	}}, Options{})
+	response := perform(server, http.MethodPost, "/v1/queues/q/messages", `{"payload":{}}`, "application/json")
+	if response.Code != http.StatusGatewayTimeout {
+		t.Fatalf("deadline = %d %s", response.Code, response.Body.String())
+	}
+
+	server = newTestServer(t, &fakeService{enqueue: func(context.Context, string, model.EnqueueRequest) (model.Message, bool, error) {
+		return model.Message{}, false, context.Canceled
+	}}, Options{})
+	response = perform(server, http.MethodPost, "/v1/queues/q/messages", `{"payload":{}}`, "application/json")
+	if response.Code != 499 {
+		t.Fatalf("canceled = %d %s", response.Code, response.Body.String())
+	}
+
+	started, release := make(chan struct{}), make(chan struct{})
+	server = newTestServer(t, &fakeService{compact: func(context.Context) error { close(started); <-release; return nil }}, Options{})
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { firstDone <- perform(server, http.MethodPost, "/v1/admin/compact", `{}`, "application/json") }()
+	<-started
+	second := perform(server, http.MethodPost, "/v1/admin/compact", `{}`, "application/json")
+	if second.Code != http.StatusConflict {
+		t.Fatalf("second compaction = %d %s", second.Code, second.Body.String())
+	}
+	close(release)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first compaction = %d", first.Code)
+	}
+}
+
+func TestReceiveListAndScheduleValidationEdges(t *testing.T) {
+	server := newTestServer(t, &fakeService{}, Options{})
+	for _, test := range []struct {
+		method, target, body, contentType string
+		status                            int
+	}{
+		{http.MethodPost, "/v1/queues/q/messages:receive", `{"visibility_timeout_ms":-1}`, "application/json", 422},
+		{http.MethodPost, "/v1/queues/q/messages:receive", `{"visibility_timeout_ms":9223372036854775807}`, "application/json", 422},
+		{http.MethodPost, "/v1/queues/q/messages:receive", `{"wait_timeout_ms":-1}`, "application/json", 422},
+		{http.MethodPost, "/v1/queues/q/messages:receive", `{"wait_timeout_ms":9223372036854775807}`, "application/json", 422},
+		{http.MethodPost, "/v1/queues/q/messages", `{"payload":null}`, "application/json", 422},
+		{http.MethodPost, "/v1/queues/q/messages", `{"payload":{},"delay_ms":-1}`, "application/json", 422},
+		{http.MethodPost, "/v1/queues/q/dead-letters/m/redrive", `{"delay_ms":0,"available_at":"2026-08-26T20:00:00Z"}`, "application/json", 422},
+		{http.MethodGet, "/v1/queues/q/messages?state=unknown", "", "", 422},
+		{http.MethodGet, "/v1/queues/q/messages?cursor=a&cursor=b", "", "", 400},
+	} {
+		response := perform(server, test.method, test.target, test.body, test.contentType)
+		if response.Code != test.status {
+			t.Fatalf("%s %s = %d %s", test.method, test.target, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestStrictParserAndRequestIDHelperBranches(t *testing.T) {
+	for _, encoded := range [][]byte{
+		[]byte(`{"scalar":1,"array":[true,null,"x"],"object":{"nested":2}}`),
+		[]byte(`{"array":[`),
+		[]byte(`{"object":{"x":1`),
+	} {
+		err := validateJSONObject(encoded)
+		if bytes.Contains(encoded, []byte(`"scalar"`)) && err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(encoded, []byte(`"scalar"`)) && err == nil {
+			t.Fatalf("invalid JSON accepted: %s", encoded)
+		}
+	}
+	for value, want := range map[string]bool{
+		"request-1":              true,
+		"":                       false,
+		strings.Repeat("x", 129): false,
+		"line\nbreak":            false,
+	} {
+		if got := validRequestID(value); got != want {
+			t.Fatalf("validRequestID(%q) = %t", value, got)
+		}
+	}
+	if id := randomRequestID(); id == "" {
+		t.Fatal("empty random request ID")
+	}
+
+	server := newTestServer(t, &fakeService{}, Options{})
+	request := httptest.NewRequest(http.MethodPost, "/v1/admin/compact", nil)
+	request.ContentLength = -1
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("unknown-length empty body status = %d", response.Code)
 	}
 }

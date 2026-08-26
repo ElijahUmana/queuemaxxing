@@ -1,9 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -58,5 +62,227 @@ func TestRunCLIRejectsUnknownCommand(t *testing.T) {
 	err := runCLI(context.Background(), []string{"unknown"})
 	if err == nil || !strings.Contains(err.Error(), `unknown command "unknown"`) {
 		t.Fatalf("error = %v", err)
+	}
+	if err := runCLI(context.Background(), []string{"healthcheck", "--timeout", "0s"}); err == nil {
+		t.Fatal("invalid healthcheck command accepted")
+	}
+	if err := runCLI(context.Background(), []string{"serve", "unexpected"}); err == nil {
+		t.Fatal("unexpected serve argument accepted")
+	}
+	if err := runCLI(context.Background(), []string{"help"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCLIParsingHelpAndEnvironment(t *testing.T) {
+	t.Setenv("QMAX_LISTEN", "127.0.0.1:12345")
+	t.Setenv("QMAX_DATA_DIR", t.TempDir())
+	serve, err := parseServeConfig(nil)
+	if err != nil || serve.listenAddress != "127.0.0.1:12345" {
+		t.Fatalf("serve = %+v, %v", serve, err)
+	}
+	if _, err := parseServeConfig([]string{"--shutdown-timeout", "0s"}); err == nil {
+		t.Fatal("expected zero shutdown timeout rejection")
+	}
+	if _, err := parseHealthConfig([]string{"--timeout", "0s"}); err == nil {
+		t.Fatal("expected zero health timeout rejection")
+	}
+	if _, err := parseHealthConfig([]string{"unexpected"}); err == nil {
+		t.Fatal("expected unexpected health argument rejection")
+	}
+	var usage bytes.Buffer
+	printUsage(&usage)
+	if !strings.Contains(usage.String(), "qmax serve") || !strings.Contains(usage.String(), "qmax healthcheck") {
+		t.Fatalf("usage = %q", usage.String())
+	}
+	if err := runCLI(context.Background(), []string{"help"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunCLIEmptyArgumentsUsesDefaultServe(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	t.Setenv("QMAX_LISTEN", "127.0.0.1:0")
+	t.Setenv("QMAX_DATA_DIR", t.TempDir())
+	if err := runCLI(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunCLIHealthcheckSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/health/ready" {
+			t.Fatalf("path = %q", request.URL.Path)
+		}
+		response.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	if err := runCLI(context.Background(), []string{"healthcheck", "--url", server.URL, "--timeout", "1s"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunCLIExplicitServeAndDrain(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	_ = listener.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runCLI(ctx, []string{"serve", "--listen", address, "--data-dir", t.TempDir()}) }()
+	client := &http.Client{Timeout: time.Second}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		response, requestErr := client.Get("http://" + address + "/health/ready")
+		if requestErr == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("serve command not ready: %v", requestErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunCLIDirectFlagsServeAndDrain(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	_ = listener.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runCLI(ctx, []string{"--listen", address, "--data-dir", t.TempDir(), "--shutdown-timeout", "5s"})
+	}()
+	client := &http.Client{Timeout: time.Second}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		response, requestErr := client.Get("http://" + address + "/health/ready")
+		if requestErr == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("direct-flag server not ready: %v", requestErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRunServesAndDrains(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, config{listenAddress: address, dataDirectory: t.TempDir(), shutdownTimeout: 5 * time.Second})
+	}()
+	client := &http.Client{Timeout: time.Second}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		response, requestErr := client.Get("http://" + address + "/health/ready")
+		if requestErr == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server did not become ready: %v", requestErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server did not drain")
+	}
+}
+
+func TestHealthcheckRejectsMalformedURLAndTransportFailure(t *testing.T) {
+	for _, config := range []healthConfig{
+		{baseURL: "://", timeout: time.Second},
+		{baseURL: "https://user@example.com", timeout: time.Second},
+		{baseURL: "http://127.0.0.1:1", timeout: 10 * time.Millisecond},
+	} {
+		if err := healthcheck(context.Background(), config); err == nil {
+			t.Fatalf("healthcheck accepted %+v", config)
+		}
+	}
+}
+
+func TestMainEnvironmentFallback(t *testing.T) {
+	const name = "QMAX_TEST_ENV"
+	_ = os.Unsetenv(name)
+	if value := envOrDefault(name, "fallback"); value != "fallback" {
+		t.Fatalf("fallback = %q", value)
+	}
+	t.Setenv(name, "configured")
+	if value := envOrDefault(name, "fallback"); value != "configured" {
+		t.Fatalf("configured = %q", value)
+	}
+}
+
+func TestMainHelpWrapper(t *testing.T) {
+	oldArgs := os.Args
+	t.Cleanup(func() { os.Args = oldArgs })
+	os.Args = []string{"qmax", "help"}
+	main()
+}
+
+func TestMainSubprocessDispatch(t *testing.T) {
+	if os.Getenv("QMAX_MAIN_HELPER") == "1" {
+		os.Args = append([]string{"qmax"}, strings.Fields(os.Getenv("QMAX_MAIN_ARGS"))...)
+		main()
+		return
+	}
+	for _, test := range []struct {
+		name string
+		args []string
+		ok   bool
+	}{
+		{name: "help", args: []string{"help"}, ok: true},
+		{name: "unknown", args: []string{"unknown"}, ok: false},
+		{name: "bad-health", args: []string{"healthcheck", "--url", "file:///tmp/x"}, ok: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := exec.Command(os.Args[0], "-test.run", "^TestMainSubprocessDispatch$")
+			command.Env = append(os.Environ(), "QMAX_MAIN_HELPER=1", "QMAX_MAIN_ARGS="+strings.Join(test.args, " "))
+			output, err := command.CombinedOutput()
+			if test.ok && err != nil {
+				t.Fatalf("error = %v\n%s", err, output)
+			}
+			if !test.ok && err == nil {
+				t.Fatalf("expected failure: %s", output)
+			}
+		})
 	}
 }

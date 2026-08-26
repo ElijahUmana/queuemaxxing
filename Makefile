@@ -33,7 +33,8 @@ fmt-check:
 vet:
 	$(GO) vet ./...
 
-verify: fmt-check vet test test-race
+verify:
+	ARTIFACT_DIR="$(ARTIFACT_DIR)" ./scripts/verify.sh
 
 clean:
 	rm -rf "$(BIN_DIR)" "$(ARTIFACT_DIR)"
