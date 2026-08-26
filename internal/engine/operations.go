@@ -165,6 +165,7 @@ func (s *service) Enqueue(ctx context.Context, queueName string, request model.E
 		}
 		s.state.NextSequence++
 		queue.Messages[messageID] = message
+		s.totalMessages++
 		message.LastLSN = s.nextLSNLocked()
 		result.Message = cloneMessage(message)
 		return s.saveIdempotencyLocked(operationEnqueue, queueName, request.IdempotencyKey, requestFingerprint, result)
@@ -471,6 +472,7 @@ func (s *service) Redrive(ctx context.Context, queueName string, request model.R
 		}
 		s.state.NextSequence++
 		queue.Messages[child.ID] = child
+		s.totalMessages++
 		source.LastLSN = s.nextLSNLocked()
 		child.LastLSN = source.LastLSN
 		result.Result = model.RedriveResult{Source: cloneMessage(source), Child: cloneMessage(child)}
@@ -700,6 +702,10 @@ func (s *service) Compact(ctx context.Context) error {
 		return &Error{Code: CodeStorageUnavailable, Message: "checkpoint queue state", Cause: err}
 	}
 	s.state = checkpoint
+	s.totalMessages = 0
+	for _, queue := range checkpoint.Queues {
+		s.totalMessages += len(queue.Messages)
+	}
 	s.notifyLocked()
 	return nil
 }

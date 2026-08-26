@@ -117,11 +117,11 @@ type stateDelta struct {
 }
 
 type service struct {
-	mu      sync.Mutex
-	journal journal.Journal
-	clock   queueclock.Clock
-	limits  Limits
-	state   persistedState
+	mu            sync.Mutex
+	journal       journal.Journal
+	clock         queueclock.Clock
+	limits        Limits
+	state         persistedState
 	wake          chan struct{}
 	closed        bool
 	totalMessages int
@@ -267,6 +267,7 @@ func (s *service) validateRecoveredState() error {
 		if queue == nil {
 			return fmt.Errorf("queue %q has nil state", name)
 		}
+		s.totalMessages += len(queue.Messages)
 		if queue.Messages == nil {
 			queue.Messages = make(map[string]*model.Message)
 		}
@@ -582,18 +583,29 @@ func cloneStateForCheckpoint(state persistedState) (persistedState, error) {
 }
 
 func cloneQueueState(queue *queueState) (*queueState, error) {
-	if queue == nil { return nil, nil }
+	if queue == nil {
+		return nil, nil
+	}
 	clone := &queueState{
-		Config: queue.Config,
-		Messages: make(map[string]*model.Message, len(queue.Messages)),
-		Receipts: make(map[string]string, len(queue.Receipts)),
-		AckedAt: make(map[string]time.Time, len(queue.AckedAt)),
+		Config:        queue.Config,
+		Messages:      make(map[string]*model.Message, len(queue.Messages)),
+		Receipts:      make(map[string]string, len(queue.Receipts)),
+		AckedAt:       make(map[string]time.Time, len(queue.AckedAt)),
 		AckedReceipts: make(map[string]ackReceipt, len(queue.AckedReceipts)),
 	}
-	for id, message := range queue.Messages { copy := *message; clone.Messages[id] = &copy }
-	for id, receipt := range queue.Receipts { clone.Receipts[id] = receipt }
-	for id, ackedAt := range queue.AckedAt { clone.AckedAt[id] = ackedAt }
-	for receipt, record := range queue.AckedReceipts { clone.AckedReceipts[receipt] = record }
+	for id, message := range queue.Messages {
+		copy := *message
+		clone.Messages[id] = &copy
+	}
+	for id, receipt := range queue.Receipts {
+		clone.Receipts[id] = receipt
+	}
+	for id, ackedAt := range queue.AckedAt {
+		clone.AckedAt[id] = ackedAt
+	}
+	for receipt, record := range queue.AckedReceipts {
+		clone.AckedReceipts[receipt] = record
+	}
 	return clone, nil
 }
 
@@ -602,13 +614,14 @@ type mutationBackup struct {
 	queue            *queueState
 	queueExisted     bool
 	nextSequence     uint64
+	totalMessages    int
 	idempotencyID    string
 	idempotency      idempotencyRecord
 	idempotencyFound bool
 }
 
 func (s *service) backupMutationLocked(queueName, operation, key string) (mutationBackup, error) {
-	backup := mutationBackup{queueName: queueName, nextSequence: s.state.NextSequence}
+	backup := mutationBackup{queueName: queueName, nextSequence: s.state.NextSequence, totalMessages: s.totalMessages}
 	if queue, exists := s.state.Queues[queueName]; exists {
 		clone, err := cloneQueueState(queue)
 		if err != nil {
@@ -625,6 +638,7 @@ func (s *service) backupMutationLocked(queueName, operation, key string) (mutati
 
 func (s *service) restoreMutationLocked(backup mutationBackup) {
 	s.state.NextSequence = backup.nextSequence
+	s.totalMessages = backup.totalMessages
 	if backup.queueExisted {
 		s.state.Queues[backup.queueName] = backup.queue
 	} else {
@@ -839,14 +853,8 @@ func logicalState(message *model.Message, now time.Time, maxDeliveries uint32) m
 	return message.State
 }
 
-func queueMessageCount(queue *queueState) int { return len(queue.Messages) }
-func (s *service) totalMessageCountLocked() int {
-	total := 0
-	for _, queue := range s.state.Queues {
-		total += len(queue.Messages)
-	}
-	return total
-}
+func queueMessageCount(queue *queueState) int   { return len(queue.Messages) }
+func (s *service) totalMessageCountLocked() int { return s.totalMessages }
 
 func newID() (string, error) {
 	var bytes [16]byte
