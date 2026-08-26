@@ -208,7 +208,17 @@ func (journal *FileJournal) open() error {
 	}
 
 	if !hasHead {
-		return &CorruptionError{Path: filepath.Join(journal.dir, "HEAD"), Reason: "WAL segments exist without durable head metadata"}
+		if err := journal.recoverInterruptedInitialization(segments, snapshots); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := journal.reconcileUncommittedSnapshots(head); err != nil {
+		return err
+	}
+	snapshots, err = journal.loadSnapshots()
+	if err != nil {
+		return err
 	}
 	metas, recovered, storeID, err := journal.recoverSegments(segments, snapshots, head)
 	if err != nil {
@@ -238,6 +248,72 @@ func (journal *FileJournal) open() error {
 		}
 	}
 	return nil
+}
+
+func (journal *FileJournal) recoverInterruptedInitialization(segments []string, snapshots []snapshotCandidate) error {
+	if len(segments) != 1 || len(snapshots) != 0 {
+		return &CorruptionError{Path: filepath.Join(journal.dir, "HEAD"), Reason: "WAL segments exist without durable head metadata"}
+	}
+	contents, err := os.ReadFile(segments[0])
+	if err != nil {
+		return err
+	}
+	header, err := decodeSegmentHeader(segments[0], contents)
+	if err != nil {
+		return err
+	}
+	if header.ID != 1 || header.FirstLSN != 1 || header.Previous != ([32]byte{}) || len(contents) != segmentHeaderSize {
+		return &CorruptionError{Path: segments[0], Reason: "non-pristine WAL exists without durable head metadata"}
+	}
+	journal.storeID = header.StoreID
+	journal.activePath = segments[0]
+	journal.activeID = 1
+	journal.activeSize = int64(segmentHeaderSize)
+	journal.walBytes = int64(segmentHeaderSize)
+	journal.segments = 1
+	journal.active, err = os.OpenFile(segments[0], os.O_RDWR|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	return journal.persistHeadLocked(headState{StoreID: journal.storeID, WALFloor: 1, WALHead: 1})
+}
+
+func (journal *FileJournal) reconcileUncommittedSnapshots(head headState) error {
+	candidates, err := journal.loadSnapshots()
+	if err != nil {
+		return err
+	}
+	quarantine := make([]snapshotCandidate, 0)
+	for _, candidate := range candidates {
+		if candidate.snapshot.Generation > head.SnapshotGeneration || (candidate.snapshot.Generation == head.SnapshotGeneration && candidate.snapshot.ThroughLSN != head.SnapshotThroughLSN) {
+			quarantine = append(quarantine, candidate)
+		}
+	}
+	if len(quarantine) == 0 {
+		return nil
+	}
+	quarantineDir := filepath.Join(journal.dir, "quarantine")
+	if err := os.MkdirAll(quarantineDir, 0o700); err != nil {
+		return err
+	}
+	if err := journal.syncDirectoryLocked(journal.dir); err != nil {
+		return err
+	}
+	for _, candidate := range quarantine {
+		destination := filepath.Join(quarantineDir, filepath.Base(candidate.path)+".uncommitted")
+		if _, err := os.Stat(destination); err == nil {
+			return &CorruptionError{Path: destination, Reason: "uncommitted snapshot quarantine destination already exists"}
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.Rename(candidate.path, destination); err != nil {
+			return err
+		}
+	}
+	if err := journal.syncDirectoryLocked(quarantineDir); err != nil {
+		return err
+	}
+	return journal.syncDirectoryLocked(journal.snapshotDir)
 }
 
 func (journal *FileJournal) removeInterruptedPublications() error {

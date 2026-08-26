@@ -3,6 +3,7 @@ package journal
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
@@ -130,6 +131,36 @@ func TestRecoveryRejectsMissingWALFloorOrHead(t *testing.T) {
 	}
 }
 
+func TestRecoveryQuarantinesSegmentBeyondDurableHead(t *testing.T) {
+	dir := t.TempDir()
+	journal := openTestJournal(t, Config{Dir: dir})
+	if _, err := journal.Append(context.Background(), TransactionID{1}, []byte("committed")); err != nil {
+		t.Fatal(err)
+	}
+	journal.mu.Lock()
+	contents, err := os.ReadFile(journal.activePath)
+	if err != nil {
+		journal.mu.Unlock()
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(contents)
+	if err := journal.createSegment(journal.activeID+1, journal.nextLSN, digest); err != nil {
+		journal.mu.Unlock()
+		t.Fatal(err)
+	}
+	journal.mu.Unlock()
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened := openTestJournal(t, Config{Dir: dir})
+	assertRecords(t, reopened.Records(), []Record{{LSN: 1, TransactionID: TransactionID{1}, Payload: []byte("committed")}})
+	quarantined, err := filepath.Glob(filepath.Join(dir, "quarantine", "*.uncommitted"))
+	if err != nil || len(quarantined) != 1 {
+		t.Fatalf("uncommitted quarantine = %v, error = %v", quarantined, err)
+	}
+}
+
 func TestRecoveryDiscardsFullyWrittenSuffixBeyondDurableHead(t *testing.T) {
 	dir := t.TempDir()
 	journal := openTestJournal(t, Config{Dir: dir})
@@ -251,6 +282,28 @@ func TestRecoveryRejectsCorruptionBeforeValidRecord(t *testing.T) {
 	}
 }
 
+func TestOpenRecoversInterruptedInitialHeadPublication(t *testing.T) {
+	dir := t.TempDir()
+	failed := false
+	_, err := Open(Config{
+		Dir: dir,
+		Faults: FaultHooks{BeforeRename: func(_, newPath string) error {
+			if filepath.Base(newPath) == "HEAD" {
+				failed = true
+				return errors.New("initial head failure")
+			}
+			return nil
+		}},
+	})
+	if err == nil || !failed {
+		t.Fatalf("Open() error = %v, failed = %v", err, failed)
+	}
+	recovered := openTestJournal(t, Config{Dir: dir})
+	if lsn, err := recovered.Append(context.Background(), TransactionID{1}, []byte("first")); err != nil || lsn != 1 {
+		t.Fatalf("Append() = (%d, %v), want (1, nil)", lsn, err)
+	}
+}
+
 func TestCheckpointHeadFailureDoesNotPublishSnapshotInMemory(t *testing.T) {
 	dir := t.TempDir()
 	failHead := false
@@ -273,6 +326,16 @@ func TestCheckpointHeadFailureDoesNotPublishSnapshotInMemory(t *testing.T) {
 	}
 	if snapshot := journal.Snapshot(); snapshot.Generation != 0 || snapshot.ThroughLSN != 0 || len(snapshot.Payload) != 0 {
 		t.Fatalf("Snapshot() = %+v, want zero snapshot", snapshot)
+	}
+	if err := journal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered := openTestJournal(t, Config{Dir: dir})
+	if err := recovered.Checkpoint(context.Background(), 1, []byte("committed-on-retry")); err != nil {
+		t.Fatalf("checkpoint retry error = %v", err)
+	}
+	if snapshot := recovered.Snapshot(); snapshot.Generation != 1 || string(snapshot.Payload) != "committed-on-retry" {
+		t.Fatalf("retried Snapshot() = %+v", snapshot)
 	}
 }
 

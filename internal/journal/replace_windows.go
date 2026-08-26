@@ -9,7 +9,7 @@ import (
 
 const (
 	movefileReplaceExisting = 0x00000001
-	movefileWriteThrough     = 0x00000008
+	movefileWriteThrough    = 0x00000008
 )
 
 var procMoveFileExW = kernel32.NewProc("MoveFileExW")
