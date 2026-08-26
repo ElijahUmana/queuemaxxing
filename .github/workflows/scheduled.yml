@@ -1,0 +1,91 @@
+name: scheduled-verification
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: chmod +x scripts/fuzz.sh
+      - run: FUZZ_TIME=30m scripts/fuzz.sh
+      - name: Upload fuzz corpus and failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ github.run_attempt }}
+          path: |
+            artifacts/
+            **/testdata/fuzz/
+          if-no-files-found: ignore
+
+  race-stress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go install golang.org/x/tools/cmd/stress@latest
+      - run: go test -race -c -o artifacts/integration-race.test ./internal/integration
+      - run: stress -p 8 -timeout 30m artifacts/integration-race.test
+      - name: Upload race evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: race-stress-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: ignore
+
+  corruption:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Exhaust every WAL byte and bit
+        run: go test ./internal/integration -run '^TestWALCorruptionRefusesStartupEveryByteAndBit$' -count=1 -v
+        env:
+          QMAX_EXHAUSTIVE_CORRUPTION: "1"
+      - name: Upload corruption evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: corruption-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: ignore
+
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: chmod +x scripts/benchmark.sh
+      - run: scripts/benchmark.sh
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: error

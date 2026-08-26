@@ -1,0 +1,96 @@
+name: verification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Format
+        if: runner.os != 'Windows'
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Test with shuffled order and coverage
+        shell: bash
+        run: mkdir -p artifacts && go test ./... -count=1 -shuffle=on -coverprofile=artifacts/coverage.out
+      - name: Race detector
+        if: runner.os != 'Windows'
+        run: go test ./... -race -count=1
+      - name: Real binary crash durability
+        if: runner.os == 'Linux'
+        run: go test ./internal/integration -run '^TestRealBinarySIGKILLPreservesConfirmedMutations$' -count=1 -v
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-${{ matrix.os }}-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: ignore
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - run: go install honnef.co/go/tools/cmd/staticcheck@latest
+      - run: go install github.com/securego/gosec/v2/cmd/gosec@latest
+      - run: govulncheck ./...
+      - run: staticcheck ./...
+      - run: gosec ./...
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: test/browser/package-lock.json
+      - run: make build
+      - run: npm ci --prefix test/browser
+      - run: npx --prefix test/browser playwright install --with-deps chromium firefox webkit
+      - name: Start real services
+        shell: bash
+        run: |
+          mkdir -p artifacts/e2e data/e2e
+          ./bin/qmax -listen 127.0.0.1:8080 -data-dir data/e2e >artifacts/e2e/qmax.stdout 2>artifacts/e2e/qmax.stderr &
+          echo $! > artifacts/e2e/qmax.pid
+          ./bin/qmax-workbench -listen 127.0.0.1:8081 -api-url http://127.0.0.1:8080 >artifacts/e2e/workbench.stdout 2>artifacts/e2e/workbench.stderr &
+          echo $! > artifacts/e2e/workbench.pid
+          timeout 30s sh -c 'until curl --fail --silent http://127.0.0.1:8081/healthz; do sleep 0.05; done'
+      - name: Run browser tests
+        run: npm test --prefix test/browser
+        env:
+          QMAX_WORKBENCH_URL: http://127.0.0.1:8081
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-${{ github.run_attempt }}
+          path: artifacts/
+          if-no-files-found: ignore
