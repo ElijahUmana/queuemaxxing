@@ -122,8 +122,9 @@ type service struct {
 	clock   queueclock.Clock
 	limits  Limits
 	state   persistedState
-	wake    chan struct{}
-	closed  bool
+	wake          chan struct{}
+	closed        bool
+	totalMessages int
 }
 
 func New(store journal.Journal, serviceClock queueclock.Clock, options Options) (Service, error) {
@@ -284,20 +285,31 @@ func (s *service) validateRecoveredState() error {
 				return fmt.Errorf("queue %q has invalid receipt for message %q", name, id)
 			}
 		}
+		for id, message := range queue.Messages {
+			if message.State == model.StateLeased {
+				receipt := queue.Receipts[id]
+				if receipt == "" || message.LeasedAt == nil || message.LeaseUntil == nil {
+					return fmt.Errorf("queue %q has incomplete lease for message %q", name, id)
+				}
+			} else if _, exists := queue.Receipts[id]; exists || message.LeasedAt != nil || message.LeaseUntil != nil {
+				return fmt.Errorf("queue %q has lease data on non-leased message %q", name, id)
+			}
+		}
 	}
 	return nil
 }
 
-func (s *service) persistLocked(ctx context.Context, before persistedState) (uint64, error) {
-	delta := diffState(before, s.state)
-	expectedLSN := s.journal.Stats().DurableLSN + 1
+func (s *service) nextLSNLocked() uint64 { return s.journal.Stats().DurableLSN + 1 }
+
+func (s *service) persistDeltaLocked(ctx context.Context, delta stateDelta) (uint64, error) {
+	expectedLSN := s.nextLSNLocked()
 	for queueName, messages := range delta.UpsertMessages {
 		queue := s.state.Queues[queueName]
 		for messageID := range messages {
 			queue.Messages[messageID].LastLSN = expectedLSN
+			messages[messageID] = queue.Messages[messageID]
 		}
 	}
-	delta = diffState(before, s.state)
 	envelopeBytes, err := json.Marshal(persistedEnvelope{Kind: "delta", Version: stateVersion, Delta: &delta})
 	if err != nil {
 		return 0, fmt.Errorf("encode state delta: %w", err)
@@ -557,7 +569,7 @@ func applyAckPointers(state *persistedState, changes map[string]map[string]*ackR
 	}
 }
 
-func cloneState(state persistedState) (persistedState, error) {
+func cloneStateForCheckpoint(state persistedState) (persistedState, error) {
 	encoded, err := json.Marshal(state)
 	if err != nil {
 		return persistedState{}, err
@@ -569,7 +581,97 @@ func cloneState(state persistedState) (persistedState, error) {
 	return clone, nil
 }
 
-func (s *service) mutate(ctx context.Context, operation func() error) error {
+func cloneQueueState(queue *queueState) (*queueState, error) {
+	if queue == nil { return nil, nil }
+	clone := &queueState{
+		Config: queue.Config,
+		Messages: make(map[string]*model.Message, len(queue.Messages)),
+		Receipts: make(map[string]string, len(queue.Receipts)),
+		AckedAt: make(map[string]time.Time, len(queue.AckedAt)),
+		AckedReceipts: make(map[string]ackReceipt, len(queue.AckedReceipts)),
+	}
+	for id, message := range queue.Messages { copy := *message; clone.Messages[id] = &copy }
+	for id, receipt := range queue.Receipts { clone.Receipts[id] = receipt }
+	for id, ackedAt := range queue.AckedAt { clone.AckedAt[id] = ackedAt }
+	for receipt, record := range queue.AckedReceipts { clone.AckedReceipts[receipt] = record }
+	return clone, nil
+}
+
+type mutationBackup struct {
+	queueName        string
+	queue            *queueState
+	queueExisted     bool
+	nextSequence     uint64
+	idempotencyID    string
+	idempotency      idempotencyRecord
+	idempotencyFound bool
+}
+
+func (s *service) backupMutationLocked(queueName, operation, key string) (mutationBackup, error) {
+	backup := mutationBackup{queueName: queueName, nextSequence: s.state.NextSequence}
+	if queue, exists := s.state.Queues[queueName]; exists {
+		clone, err := cloneQueueState(queue)
+		if err != nil {
+			return mutationBackup{}, err
+		}
+		backup.queue, backup.queueExisted = clone, true
+	}
+	if key != "" {
+		backup.idempotencyID = idempotencyID(operation, queueName, key)
+		backup.idempotency, backup.idempotencyFound = s.state.Idempotency[backup.idempotencyID]
+	}
+	return backup, nil
+}
+
+func (s *service) restoreMutationLocked(backup mutationBackup) {
+	s.state.NextSequence = backup.nextSequence
+	if backup.queueExisted {
+		s.state.Queues[backup.queueName] = backup.queue
+	} else {
+		delete(s.state.Queues, backup.queueName)
+	}
+	if backup.idempotencyID != "" {
+		if backup.idempotencyFound {
+			s.state.Idempotency[backup.idempotencyID] = backup.idempotency
+		} else {
+			delete(s.state.Idempotency, backup.idempotencyID)
+		}
+	}
+}
+
+func (s *service) mutationDeltaLocked(backup mutationBackup) stateDelta {
+	delta := stateDelta{NextSequence: s.state.NextSequence}
+	queue := s.state.Queues[backup.queueName]
+	if !backup.queueExisted {
+		if queue != nil {
+			delta.UpsertQueues = map[string]*queueState{backup.queueName: queue}
+		}
+	} else if queue == nil {
+		delta.DeleteQueues = []string{backup.queueName}
+	} else {
+		before := persistedState{Queues: map[string]*queueState{backup.queueName: backup.queue}, Idempotency: map[string]idempotencyRecord{}}
+		after := persistedState{Queues: map[string]*queueState{backup.queueName: queue}, Idempotency: map[string]idempotencyRecord{}}
+		queueDelta := diffState(before, after)
+		delta.UpsertQueues, delta.DeleteQueues = queueDelta.UpsertQueues, queueDelta.DeleteQueues
+		delta.UpsertMessages, delta.DeleteMessages = queueDelta.UpsertMessages, queueDelta.DeleteMessages
+		delta.Receipts, delta.AckedAt, delta.AckedReceipts = queueDelta.Receipts, queueDelta.AckedAt, queueDelta.AckedReceipts
+	}
+	if backup.idempotencyID != "" {
+		record, exists := s.state.Idempotency[backup.idempotencyID]
+		if exists && (!backup.idempotencyFound || !reflect.DeepEqual(record, backup.idempotency)) {
+			delta.UpsertIdempotency = map[string]idempotencyRecord{backup.idempotencyID: record}
+		} else if !exists && backup.idempotencyFound {
+			delta.DeleteIdempotency = []string{backup.idempotencyID}
+		}
+	}
+	return delta
+}
+
+func deltaHasChanges(delta stateDelta, previousSequence uint64) bool {
+	return delta.NextSequence != previousSequence || len(delta.UpsertQueues)+len(delta.DeleteQueues)+len(delta.UpsertMessages)+len(delta.DeleteMessages)+len(delta.Receipts)+len(delta.AckedAt)+len(delta.AckedReceipts)+len(delta.UpsertIdempotency)+len(delta.DeleteIdempotency) > 0
+}
+
+func (s *service) mutate(ctx context.Context, queueName, operation, key string, mutation func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -578,16 +680,20 @@ func (s *service) mutate(ctx context.Context, operation func() error) error {
 	if s.closed {
 		return &Error{Code: CodeClosed, Message: "queue service is closed"}
 	}
-	before, err := cloneState(s.state)
+	backup, err := s.backupMutationLocked(queueName, operation, key)
 	if err != nil {
-		return &Error{Code: CodeStorageUnavailable, Message: "snapshot queue state", Cause: err}
+		return &Error{Code: CodeStorageUnavailable, Message: "snapshot queue mutation", Cause: err}
 	}
-	if err := operation(); err != nil {
-		s.state = before
+	if err := mutation(); err != nil {
+		s.restoreMutationLocked(backup)
 		return err
 	}
-	if _, err := s.persistLocked(ctx, before); err != nil {
-		s.state = before
+	delta := s.mutationDeltaLocked(backup)
+	if !deltaHasChanges(delta, backup.nextSequence) {
+		return nil
+	}
+	if _, err := s.persistDeltaLocked(ctx, delta); err != nil {
+		s.restoreMutationLocked(backup)
 		return &Error{Code: CodeStorageUnavailable, Message: "persist queue state", Cause: err}
 	}
 	s.notifyLocked()
@@ -647,7 +753,6 @@ func (s *service) saveIdempotencyLocked(operation, queue, key, requestFingerprin
 		return invalid("idempotency key exceeds configured limit")
 	}
 	now := s.clock.Now()
-	s.pruneIdempotencyLocked(now)
 	id := idempotencyID(operation, queue, key)
 	if _, exists := s.state.Idempotency[id]; !exists && len(s.state.Idempotency) >= s.limits.MaxIdempotencyRecords {
 		return &Error{Code: CodeCapacityExceeded, Message: "idempotency record capacity exceeded"}
