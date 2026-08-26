@@ -55,6 +55,7 @@ function bindEvents() {
   document.querySelectorAll("[data-open-create], #open-create-queue").forEach((button) => button.addEventListener("click", openCreateDialog));
   document.querySelectorAll("[data-close-dialog]").forEach((button) => button.addEventListener("click", () => ui.createDialog.close()));
   ui.createDialog.addEventListener("click", (event) => { if (event.target === ui.createDialog) ui.createDialog.close(); });
+  ui.createDialog.addEventListener("keydown", trapDialogFocus);
   ui.createForm.addEventListener("submit", createQueue);
   ui.queueFilter.addEventListener("input", renderQueueList);
   document.getElementById("refresh-all").addEventListener("click", () => refreshOverview());
@@ -289,6 +290,22 @@ function messageState(value) {
 }
 function cellWith(child) { const cell = document.createElement("td"); cell.append(child); return cell; }
 function textCell(value) { const cell = document.createElement("td"); cell.textContent = value; return cell; }
+
+function trapDialogFocus(event) {
+  if (event.key !== "Tab") return;
+  const focusable = [...ui.createDialog.querySelectorAll("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex='-1'])")]
+    .filter((node) => node.getClientRects().length > 0);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
 
 function openCreateDialog() {
   ui.createForm.reset();

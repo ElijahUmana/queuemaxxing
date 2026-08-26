@@ -117,9 +117,9 @@ func newHandler(apiURL string, logger *slog.Logger) (http.Handler, error) {
 	}
 	proxy.ErrorHandler = func(response http.ResponseWriter, request *http.Request, proxyErr error) {
 		logger.Warn("queue API unavailable", "method", request.Method, "path", request.URL.Path, "error", proxyErr)
-		response.Header().Set("Content-Type", "application/json")
+		response.Header().Set("Content-Type", "application/problem+json")
 		response.WriteHeader(http.StatusBadGateway)
-		_, _ = response.Write([]byte(`{"error":{"code":"api_unavailable","message":"The queue API is unavailable."}}`))
+		_, _ = response.Write([]byte(`{"type":"urn:queuemaxxing:problem:api_unavailable","title":"Queue API unavailable","status":502,"code":"api_unavailable","detail":"The queue API is unavailable.","request_id":""}`))
 	}
 
 	mux := http.NewServeMux()
