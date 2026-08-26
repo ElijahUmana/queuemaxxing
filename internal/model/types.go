@@ -76,7 +76,9 @@ type QueueInfo struct {
 type EnqueueRequest struct {
 	Payload        json.RawMessage `json:"payload"`
 	Priority       int32           `json:"priority"`
+	PrioritySet    bool            `json:"priority_set"`
 	Delay          time.Duration   `json:"delay"`
+	DelaySet       bool            `json:"delay_set"`
 	AvailableAt    *time.Time      `json:"available_at,omitempty"`
 	IdempotencyKey string          `json:"-"`
 }

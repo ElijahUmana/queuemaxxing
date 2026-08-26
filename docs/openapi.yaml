@@ -1,0 +1,359 @@
+openapi: 3.1.0
+info:
+  title: Queuemaxxing API
+  version: 1.0.0
+  description: Durable single-node queue API. All durations are integer milliseconds and all timestamps are server-authoritative RFC 3339 values.
+servers:
+  - url: http://127.0.0.1:8080
+security: []
+paths:
+  /health/live:
+    get:
+      operationId: live
+      responses:
+        '200': {description: Process is live, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
+  /health/ready:
+    get:
+      operationId: ready
+      responses:
+        '200': {description: Recovery is complete and durable storage is writable, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/queues:
+    post:
+      operationId: createQueue
+      parameters: [{$ref: '#/components/parameters/OptionalIdempotencyKey'}]
+      requestBody: {$ref: '#/components/requestBodies/CreateQueue'}
+      responses:
+        '201': {description: Queue durably created, content: {application/json: {schema: {$ref: '#/components/schemas/QueueMutation'}}}}
+        '200': {description: Idempotent replay, content: {application/json: {schema: {$ref: '#/components/schemas/QueueMutation'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '415': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      operationId: listQueues
+      responses:
+        '200':
+          description: Queue collection
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [queues]
+                properties: {queues: {type: array, items: {$ref: '#/components/schemas/Queue'}}}
+  /v1/queues/{queue}:
+    parameters: [{$ref: '#/components/parameters/Queue'}]
+    get:
+      operationId: getQueue
+      responses:
+        '200': {description: Queue state, content: {application/json: {schema: {$ref: '#/components/schemas/Queue'}}}}
+        '404': {$ref: '#/components/responses/Problem'}
+  /v1/queues/{queue}/messages:
+    parameters: [{$ref: '#/components/parameters/Queue'}]
+    post:
+      operationId: enqueue
+      parameters: [{$ref: '#/components/parameters/OptionalIdempotencyKey'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/EnqueueRequest'}}}
+      responses:
+        '201': {description: Message durably enqueued, content: {application/json: {schema: {$ref: '#/components/schemas/MessageMutation'}}}}
+        '200': {description: Idempotent replay, content: {application/json: {schema: {$ref: '#/components/schemas/MessageMutation'}}}}
+        '409': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+    get:
+      operationId: listMessages
+      parameters: [{$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/State'}]
+      responses:
+        '200': {description: Weakly consistent keyset page, content: {application/json: {schema: {$ref: '#/components/schemas/MessagePage'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+  /v1/queues/{queue}/messages:receive:
+    parameters: [{$ref: '#/components/parameters/Queue'}]
+    post:
+      operationId: receive
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ReceiveRequest'}}}
+      responses:
+        '200':
+          description: One reserved message or an empty messages array after long-poll timeout
+          content: {application/json: {schema: {$ref: '#/components/schemas/ReceiveResponse'}}}
+        '422': {$ref: '#/components/responses/Problem'}
+        '503': {$ref: '#/components/responses/Problem'}
+  /v1/queues/{queue}/messages/{message}/ack:
+    parameters: [{$ref: '#/components/parameters/Queue'}, {$ref: '#/components/parameters/Message'}, {$ref: '#/components/parameters/OptionalIdempotencyKey'}]
+    post:
+      operationId: ack
+      requestBody: {$ref: '#/components/requestBodies/Receipt'}
+      responses:
+        '200': {description: Message acknowledged, content: {application/json: {schema: {$ref: '#/components/schemas/AckResponse'}}}}
+        '409': {$ref: '#/components/responses/Problem'}
+  /v1/queues/{queue}/messages/{message}/nack:
+    parameters: [{$ref: '#/components/parameters/Queue'}, {$ref: '#/components/parameters/Message'}, {$ref: '#/components/parameters/OptionalIdempotencyKey'}]
+    post:
+      operationId: nack
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/NackRequest'}}}
+      responses:
+        '200': {description: Message requeued or dead-lettered, content: {application/json: {schema: {$ref: '#/components/schemas/MessageMutation'}}}}
+        '409': {$ref: '#/components/responses/Problem'}
+  /v1/queues/{queue}/messages/{message}/extend:
+    parameters: [{$ref: '#/components/parameters/Queue'}, {$ref: '#/components/parameters/Message'}, {$ref: '#/components/parameters/OptionalIdempotencyKey'}]
+    post:
+      operationId: extend
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ExtendRequest'}}}
+      responses:
+        '200': {description: Lease deadline replaced, content: {application/json: {schema: {$ref: '#/components/schemas/DeliveryMutation'}}}}
+        '409': {$ref: '#/components/responses/Problem'}
+  /v1/queues/{queue}/dead-letters:
+    parameters: [{$ref: '#/components/parameters/Queue'}]
+    get:
+      operationId: listDeadLetters
+      parameters: [{$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Cursor'}]
+      responses:
+        '200': {description: Dead-letter page, content: {application/json: {schema: {$ref: '#/components/schemas/MessagePage'}}}}
+  /v1/queues/{queue}/dead-letters/{message}/redrive:
+    parameters: [{$ref: '#/components/parameters/Queue'}, {$ref: '#/components/parameters/Message'}, {$ref: '#/components/parameters/RequiredIdempotencyKey'}]
+    post:
+      operationId: redrive
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/RedriveRequest'}}}
+      responses:
+        '201': {description: Child message durably created, content: {application/json: {schema: {$ref: '#/components/schemas/RedriveMutation'}}}}
+        '200': {description: Idempotent replay, content: {application/json: {schema: {$ref: '#/components/schemas/RedriveMutation'}}}}
+        '409': {$ref: '#/components/responses/Problem'}
+  /v1/stats:
+    get:
+      operationId: stats
+      responses:
+        '200': {description: Service and storage statistics, content: {application/json: {schema: {$ref: '#/components/schemas/ServiceStats'}}}}
+  /v1/admin/compact:
+    post:
+      operationId: compact
+      requestBody:
+        required: false
+        content: {application/json: {schema: {type: object, additionalProperties: false}}}
+      responses:
+        '200': {description: Compaction completed, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
+        '503': {$ref: '#/components/responses/Problem'}
+components:
+  parameters:
+    Queue: {name: queue, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
+    Message: {name: message, in: path, required: true, schema: {type: string, minLength: 1}}
+    OptionalIdempotencyKey: {name: Idempotency-Key, in: header, required: false, schema: {type: string, minLength: 1, maxLength: 256}}
+    RequiredIdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 1, maxLength: 256}}
+    Limit: {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 1000, default: 50}}
+    Cursor: {name: cursor, in: query, required: false, schema: {type: string}}
+    State: {name: state, in: query, required: false, schema: {$ref: '#/components/schemas/MessageState'}}
+  requestBodies:
+    CreateQueue:
+      required: true
+      content: {application/json: {schema: {$ref: '#/components/schemas/CreateQueueRequest'}}}
+    Receipt:
+      required: true
+      content: {application/json: {schema: {$ref: '#/components/schemas/ReceiptRequest'}}}
+  responses:
+    Problem:
+      description: Stable error envelope
+      headers:
+        X-Request-ID: {schema: {type: string}}
+      content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}
+  schemas:
+    Ordering: {type: string, enum: [fifo, lifo]}
+    MessageState: {type: string, enum: [delayed, ready, leased, acked, dead]}
+    Timestamp: {type: string, format: date-time}
+    Uint64String: {type: string, pattern: '^[0-9]+$'}
+    Milliseconds: {type: integer, format: int64, minimum: 0, maximum: 9223372036854}
+    Counts:
+      type: object
+      additionalProperties: false
+      required: [ready, delayed, in_flight, dead, acked, total]
+      properties:
+        ready: {type: integer, format: int64, minimum: 0}
+        delayed: {type: integer, format: int64, minimum: 0}
+        in_flight: {type: integer, format: int64, minimum: 0}
+        dead: {type: integer, format: int64, minimum: 0}
+        acked: {type: integer, format: int64, minimum: 0}
+        total: {type: integer, format: int64, minimum: 0}
+    CreateQueueRequest:
+      type: object
+      additionalProperties: false
+      required: [name, ordering, priority_enabled, default_delay_ms, default_visibility_timeout_ms, max_deliveries]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9._-]+$'}
+        ordering: {$ref: '#/components/schemas/Ordering'}
+        priority_enabled: {type: boolean}
+        default_delay_ms: {$ref: '#/components/schemas/Milliseconds'}
+        default_visibility_timeout_ms: {allOf: [{$ref: '#/components/schemas/Milliseconds'}, {minimum: 1}]}
+        max_deliveries: {type: integer, format: int32, minimum: 1}
+    QueueConfig:
+      allOf:
+        - {$ref: '#/components/schemas/CreateQueueRequest'}
+        - type: object
+          required: [created_at]
+          properties: {created_at: {$ref: '#/components/schemas/Timestamp'}}
+    Queue:
+      type: object
+      additionalProperties: false
+      required: [config, counts]
+      properties: {config: {$ref: '#/components/schemas/QueueConfig'}, counts: {$ref: '#/components/schemas/Counts'}}
+    EnqueueRequest:
+      type: object
+      additionalProperties: false
+      required: [payload]
+      not: {required: [delay_ms, available_at]}
+      properties:
+        payload: {}
+        priority: {type: integer, format: int32}
+        delay_ms: {$ref: '#/components/schemas/Milliseconds'}
+        available_at: {$ref: '#/components/schemas/Timestamp'}
+    ReceiveRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        visibility_timeout_ms: {allOf: [{$ref: '#/components/schemas/Milliseconds'}, {minimum: 1}]}
+        wait_timeout_ms: {$ref: '#/components/schemas/Milliseconds'}
+    ReceiptRequest:
+      type: object
+      additionalProperties: false
+      required: [receipt_handle]
+      properties: {receipt_handle: {type: string, minLength: 1, writeOnly: true}}
+    NackRequest:
+      allOf:
+        - {$ref: '#/components/schemas/ReceiptRequest'}
+        - type: object
+          additionalProperties: false
+          required: [retry_delay_ms]
+          properties: {retry_delay_ms: {$ref: '#/components/schemas/Milliseconds'}, reason: {type: string, maxLength: 512}}
+    ExtendRequest:
+      allOf:
+        - {$ref: '#/components/schemas/ReceiptRequest'}
+        - type: object
+          additionalProperties: false
+          required: [visibility_timeout_ms]
+          properties: {visibility_timeout_ms: {allOf: [{$ref: '#/components/schemas/Milliseconds'}, {minimum: 1}]}}
+    RedriveRequest:
+      type: object
+      additionalProperties: false
+      not: {required: [delay_ms, available_at]}
+      properties:
+        priority: {type: integer, format: int32}
+        delay_ms: {$ref: '#/components/schemas/Milliseconds'}
+        available_at: {$ref: '#/components/schemas/Timestamp'}
+    Message:
+      type: object
+      additionalProperties: false
+      required: [id, queue, payload, priority, sequence, enqueued_at, available_at, state, delivery_count, last_lsn]
+      properties:
+        id: {type: string}
+        queue: {type: string}
+        payload: {}
+        priority: {type: integer, format: int32}
+        sequence: {$ref: '#/components/schemas/Uint64String'}
+        enqueued_at: {$ref: '#/components/schemas/Timestamp'}
+        available_at: {$ref: '#/components/schemas/Timestamp'}
+        state: {$ref: '#/components/schemas/MessageState'}
+        delivery_count: {type: integer, format: int32, minimum: 0}
+        leased_at: {$ref: '#/components/schemas/Timestamp'}
+        lease_expires_at: {$ref: '#/components/schemas/Timestamp'}
+        last_failure_reason: {type: string}
+        dead_at: {$ref: '#/components/schemas/Timestamp'}
+        replay_of: {type: string}
+        last_lsn: {$ref: '#/components/schemas/Uint64String'}
+    Delivery:
+      type: object
+      additionalProperties: false
+      required: [message, receipt_handle, lease_expires_at, delivery_count]
+      properties:
+        message: {$ref: '#/components/schemas/Message'}
+        receipt_handle: {type: string, readOnly: true}
+        lease_expires_at: {$ref: '#/components/schemas/Timestamp'}
+        delivery_count: {type: integer, format: int32, minimum: 1}
+    QueueMutation: {$ref: '#/components/schemas/GenericQueueMutation'}
+    GenericQueueMutation:
+      type: object
+      additionalProperties: false
+      required: [data, replayed]
+      properties: {data: {$ref: '#/components/schemas/Queue'}, replayed: {type: boolean}}
+    MessageMutation:
+      type: object
+      additionalProperties: false
+      required: [data, replayed]
+      properties: {data: {$ref: '#/components/schemas/Message'}, replayed: {type: boolean}}
+    DeliveryMutation:
+      type: object
+      additionalProperties: false
+      required: [data, replayed]
+      properties: {data: {$ref: '#/components/schemas/Delivery'}, replayed: {type: boolean}}
+    ReceiveResponse:
+      type: object
+      additionalProperties: false
+      required: [messages, polled_at]
+      properties: {messages: {type: array, maxItems: 1, items: {$ref: '#/components/schemas/Delivery'}}, polled_at: {$ref: '#/components/schemas/Timestamp'}}
+    AckResponse:
+      type: object
+      additionalProperties: false
+      required: [message_id, state, replayed]
+      properties: {message_id: {type: string}, state: {const: acked}, replayed: {type: boolean}}
+    MessagePage:
+      type: object
+      additionalProperties: false
+      required: [messages, snapshot_lsn]
+      properties: {messages: {type: array, items: {$ref: '#/components/schemas/Message'}}, next_cursor: {type: string}, snapshot_lsn: {$ref: '#/components/schemas/Uint64String'}}
+    RedriveResult:
+      type: object
+      additionalProperties: false
+      required: [source, child]
+      properties: {source: {$ref: '#/components/schemas/Message'}, child: {$ref: '#/components/schemas/Message'}}
+    RedriveMutation:
+      type: object
+      additionalProperties: false
+      required: [data, replayed]
+      properties: {data: {$ref: '#/components/schemas/RedriveResult'}, replayed: {type: boolean}}
+    ServiceStats:
+      type: object
+      additionalProperties: false
+      required: [queues, messages, durable_lsn, wal_bytes, snapshot_generation, read_only]
+      properties:
+        queues: {type: integer, format: int64, minimum: 0}
+        messages: {$ref: '#/components/schemas/Counts'}
+        durable_lsn: {$ref: '#/components/schemas/Uint64String'}
+        wal_bytes: {type: integer, format: int64, minimum: 0}
+        snapshot_generation: {$ref: '#/components/schemas/Uint64String'}
+        last_sync_at: {$ref: '#/components/schemas/Timestamp'}
+        read_only: {type: boolean}
+        read_only_reason: {type: string}
+    Status:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties: {status: {type: string}}
+    Problem:
+      type: object
+      additionalProperties: false
+      required: [type, title, status, code, detail, request_id]
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        code: {type: string}
+        detail: {type: string}
+        request_id: {type: string}
+        errors:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [field, message]
+            properties: {field: {type: string}, message: {type: string}}
