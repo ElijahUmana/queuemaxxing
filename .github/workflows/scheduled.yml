@@ -85,6 +85,7 @@ jobs:
       - name: Run full queue soak
         shell: bash
         run: |
+          set -o pipefail
           mkdir -p artifacts/load data/load
           ./bin/qmax -listen 127.0.0.1:8080 -data-dir data/load >artifacts/load/qmax.stdout 2>artifacts/load/qmax.stderr &
           echo $! > artifacts/load/qmax.pid
