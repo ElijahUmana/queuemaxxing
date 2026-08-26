@@ -11,7 +11,7 @@
   <script type="module" src="/assets/app.js"></script>
 </head>
 <body>
-  <a class="skip-link" href="#workspace">Skip to workbench</a>
+  <a class="skip-link" href="#workspace" tabindex="0">Skip to workbench</a>
   <header class="topbar">
     <a class="brand" href="/" aria-label="Queuemaxxing workbench home">
       <span class="brand-mark" aria-hidden="true">Q</span>
@@ -176,7 +176,7 @@
     <form id="create-queue-form" method="dialog">
       <header><div><span class="eyebrow">IMMUTABLE POLICY</span><h2 id="create-queue-title">Create queue</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close dialog">×</button></header>
       <div class="dialog-body form-stack">
-        <label class="field"><span>Queue name</span><input id="queue-name" type="text" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="invoice-rendering" autocomplete="off"><small>Letters, numbers, period, underscore, and hyphen.</small></label>
+        <label class="field"><span>Queue name</span><input id="queue-name" type="text" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._\-]*" placeholder="invoice-rendering" autocomplete="off"><small>Letters, numbers, period, underscore, and hyphen.</small></label>
         <fieldset class="choice-group"><legend>Ordering</legend><label><input type="radio" name="ordering" value="fifo" checked><span><strong>FIFO</strong><small>Oldest eligible first</small></span></label><label><input type="radio" name="ordering" value="lifo"><span><strong>LIFO</strong><small>Newest eligible first</small></span></label></fieldset>
         <label class="switch-row"><span><strong>Priority ordering</strong><small>Higher signed priority wins before sequence.</small></span><input id="queue-priority" type="checkbox" role="switch"></label>
         <div class="form-row">

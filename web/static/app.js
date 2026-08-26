@@ -365,9 +365,10 @@ async function enqueueMessage(event) {
   const idempotencyKey = document.getElementById("enqueue-idempotency").value.trim() || uniqueKey("enqueue");
   const request = {
     payload: JSON.parse(ui.enqueuePayload.value),
-    priority: integerFromInput("enqueue-priority"),
     delay_ms: millisecondsFromInput("enqueue-delay"),
   };
+  const queueInfo = state.queueInfo || state.queues.find((queue) => queueName(queue) === state.activeQueue);
+  if (queueInfo?.config?.priority_enabled) request.priority = integerFromInput("enqueue-priority");
   try {
     const result = await api.enqueue(state.activeQueue, request, idempotencyKey);
     const message = result?.data || result;
