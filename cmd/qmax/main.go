@@ -118,15 +118,14 @@ func run(parent context.Context, config config) error {
 		return nil
 	case <-ctx.Done():
 		apiServer.SetDraining(true)
+		if err := service.Close(context.Background()); err != nil {
+			return fmt.Errorf("close queue service: %w", err)
+		}
 		shutdownContext, cancel := context.WithTimeout(context.Background(), config.shutdownTimeout)
 		defer cancel()
 		if err := httpServer.Shutdown(shutdownContext); err != nil {
 			_ = httpServer.Close()
-			_ = service.Close(shutdownContext)
 			return fmt.Errorf("shut down queue API: %w", err)
-		}
-		if err := service.Close(shutdownContext); err != nil {
-			return fmt.Errorf("close queue service: %w", err)
 		}
 		return nil
 	}
