@@ -1,0 +1,9 @@
+data/
+artifacts/
+coverage.out
+*.prof
+*.test
+.DS_Store
+node_modules/
+playwright-report/
+test-results/
