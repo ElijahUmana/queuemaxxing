@@ -1,0 +1,12 @@
+.git
+.github
+artifacts
+bin
+coverage.out
+data
+node_modules
+playwright-report
+test-results
+*.prof
+*.test
+.DS_Store

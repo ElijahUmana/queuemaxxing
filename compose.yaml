@@ -1,0 +1,36 @@
+services:
+  queue:
+    build: .
+    command: ["serve", "--listen", "0.0.0.0:8080", "--data-dir", "/data"]
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    volumes:
+      - queue-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/qmax", "healthcheck", "--url", "http://127.0.0.1:8080"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    security_opt:
+      - no-new-privileges:true
+  workbench:
+    build: .
+    entrypoint: ["/usr/local/bin/qmax-workbench"]
+    command: ["--listen", "0.0.0.0:8081", "--api-url", "http://queue:8080"]
+    init: true
+    read_only: true
+    depends_on:
+      queue:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8081:8081"
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  queue-data:
