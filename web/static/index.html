@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#090d12">
+  <meta name="description" content="Inspect and exercise every Queuemaxxing queue behavior through its public HTTP API.">
+  <title>Queue workbench</title>
+  <link rel="stylesheet" href="/assets/app.css">
+  <script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to workbench</a>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Queuemaxxing workbench home">
+      <span class="brand-mark" aria-hidden="true">Q</span>
+      <span><strong>QUEUEMAXXING</strong><small>QUEUE WORKBENCH</small></span>
+    </a>
+    <div class="topbar-status">
+      <div class="durability-mark" title="Last server-reported durable position">
+        <span>DURABLE LSN</span>
+        <output id="durable-lsn">—</output>
+      </div>
+      <div id="connection-status" class="connection-pill is-connecting" role="status">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span>Connecting</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Queue navigation">
+      <div class="sidebar-heading">
+        <div><span class="eyebrow">LOCAL SERVICE</span><h1>Queues</h1></div>
+        <button id="open-create-queue" class="icon-button" type="button" aria-label="Create queue" title="Create queue">+</button>
+      </div>
+      <label class="search-box">
+        <span class="visually-hidden">Filter queues</span>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 21-4.3-4.3m2.3-5.2a7.5 7.5 0 1 1-15 0 7.5 7.5 0 0 1 15 0Z"/></svg>
+        <input id="queue-filter" type="search" placeholder="Filter queues" autocomplete="off">
+      </label>
+      <nav id="queue-list" class="queue-list" aria-label="Available queues"></nav>
+      <div class="sidebar-footer">
+        <span>API boundary</span>
+        <code>/api/v1</code>
+      </div>
+    </aside>
+
+    <main id="workspace" class="workspace" tabindex="-1">
+      <section id="empty-state" class="empty-state">
+        <div class="empty-visual" aria-hidden="true"><span></span><span></span><span></span></div>
+        <span class="eyebrow">NO QUEUE SELECTED</span>
+        <h2>Make delivery semantics visible.</h2>
+        <p>Create a queue, compose ordering with priority and delay, then watch every durable transition through the public API.</p>
+        <button class="button button-primary" type="button" data-open-create>Create first queue</button>
+      </section>
+
+      <div id="queue-workspace" class="queue-workspace" hidden>
+        <section class="queue-hero" aria-labelledby="queue-title">
+          <div>
+            <span class="eyebrow">ACTIVE QUEUE</span>
+            <h2 id="queue-title">—</h2>
+            <div id="queue-policy" class="policy-row" aria-label="Queue policy"></div>
+          </div>
+          <div class="hero-actions">
+            <button id="refresh-all" class="button button-secondary" type="button">Refresh</button>
+            <time id="last-refresh" class="refresh-time">Not refreshed</time>
+          </div>
+        </section>
+
+        <section class="metric-grid" aria-label="Queue statistics">
+          <article class="metric-card metric-ready"><span>READY</span><strong id="count-ready">0</strong><small>eligible now</small></article>
+          <article class="metric-card metric-delayed"><span>DELAYED</span><strong id="count-delayed">0</strong><small>waiting on time</small></article>
+          <article class="metric-card metric-flight"><span>IN FLIGHT</span><strong id="count-flight">0</strong><small>active leases</small></article>
+          <article class="metric-card metric-dead"><span>DEAD</span><strong id="count-dead">0</strong><small>retained failures</small></article>
+          <article class="metric-card metric-total"><span>TOTAL</span><strong id="count-total">0</strong><small>durable records</small></article>
+        </section>
+
+        <section class="workbench-grid">
+          <div class="primary-column">
+            <article class="panel compose-panel">
+              <header class="panel-header">
+                <div><span class="panel-index">01</span><div><h3>Compose message</h3><p>Publish JSON as durable work.</p></div></div>
+                <span class="method-badge">POST</span>
+              </header>
+              <form id="enqueue-form" class="form-stack">
+                <label class="field payload-field"><span>JSON payload</span><textarea id="enqueue-payload" name="payload" rows="7" spellcheck="false" required>{
+  "task": "render-invoice",
+  "account_id": "acct_1042"
+}</textarea><small id="payload-validation">Parsed before transmission</small></label>
+                <div class="form-row three-columns">
+                  <label class="field"><span>Priority</span><input id="enqueue-priority" name="priority" type="number" value="0" step="1" min="-2147483648" max="2147483647"></label>
+                  <label class="field"><span>Delay</span><div class="input-unit"><input id="enqueue-delay" name="delay" type="number" value="0" min="0" step="100"><span>ms</span></div></label>
+                  <label class="field"><span>Idempotency key</span><input id="enqueue-idempotency" name="idempotency" type="text" maxlength="256" placeholder="Optional retry key" autocomplete="off"></label>
+                </div>
+                <div class="form-actions">
+                  <p><kbd>⌘</kbd><kbd>Enter</kbd> to enqueue</p>
+                  <button class="button button-primary" type="submit">Enqueue message</button>
+                </div>
+              </form>
+            </article>
+
+            <article class="panel delivery-panel">
+              <header class="panel-header">
+                <div><span class="panel-index">02</span><div><h3>Delivery console</h3><p>Reserve and transition one fenced lease.</p></div></div>
+                <span id="delivery-state" class="state-badge">IDLE</span>
+              </header>
+              <form id="receive-form" class="receive-controls">
+                <label class="field"><span>Visibility</span><div class="input-unit"><input id="receive-visibility" type="number" value="5000" min="1"><span>ms</span></div></label>
+                <label class="field"><span>Long poll</span><div class="input-unit"><input id="receive-wait" type="number" value="0" min="0"><span>ms</span></div></label>
+                <button class="button button-accent" type="submit">Receive next</button>
+              </form>
+              <div id="delivery-empty" class="delivery-empty"><span aria-hidden="true">↳</span><p>No active delivery.<br><small>A receipt remains in memory only while leased.</small></p></div>
+              <div id="delivery-card" class="delivery-card" hidden>
+                <div class="delivery-metadata">
+                  <div><span>MESSAGE</span><code id="delivery-message-id">—</code></div>
+                  <div><span>ATTEMPT</span><strong id="delivery-attempt">—</strong></div>
+                  <div><span>LEASE REMAINING</span><strong id="lease-countdown">—</strong></div>
+                </div>
+                <pre id="delivery-payload" class="payload-view" tabindex="0"></pre>
+                <div class="delivery-actions">
+                  <button id="ack-delivery" class="button button-success" type="button">Acknowledge</button>
+                  <button id="nack-delivery" class="button button-danger" type="button">Nack</button>
+                  <label class="compact-field"><span>Nack delay</span><div class="input-unit"><input id="nack-delay" type="number" value="0" min="0"><span>ms</span></div></label>
+                  <button id="extend-delivery" class="button button-secondary" type="button">Extend lease</button>
+                </div>
+                <p class="lease-note">Let the countdown reach zero to demonstrate server-side lease expiry and stale-receipt fencing.</p>
+              </div>
+            </article>
+
+            <article class="panel inspector-panel">
+              <header class="panel-header">
+                <div><span class="panel-index">03</span><div><h3>Durable inspector</h3><p>Server-authoritative lifecycle state.</p></div></div>
+                <div class="segmented-control" role="tablist" aria-label="Message view">
+                  <button class="is-active" type="button" role="tab" aria-selected="true" data-message-view="live">Live</button>
+                  <button type="button" role="tab" aria-selected="false" data-message-view="dead">Dead letters</button>
+                </div>
+              </header>
+              <div class="table-scroll">
+                <table>
+                  <thead><tr><th>Message</th><th>State</th><th>Priority</th><th>Attempt</th><th>Available</th><th>Payload</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
+                  <tbody id="message-table"></tbody>
+                </table>
+                <div id="messages-empty" class="table-empty">No messages in this view.</div>
+              </div>
+              <footer class="panel-footer"><button id="load-more" class="button button-quiet" type="button" hidden>Load next page</button><span id="snapshot-lsn">Snapshot LSN —</span></footer>
+            </article>
+          </div>
+
+          <aside class="secondary-column" aria-label="Automation and event log">
+            <article class="panel worker-panel">
+              <header class="panel-header compact"><div><span class="panel-index">04</span><div><h3>Worker swarm</h3><p>Concurrent public API clients.</p></div></div></header>
+              <form id="worker-form" class="form-stack">
+                <div class="form-row">
+                  <label class="field"><span>Workers</span><input id="worker-count" type="number" value="3" min="1" max="16"></label>
+                  <label class="field"><span>Behavior</span><select id="worker-behavior"><option value="ack">Ack every delivery</option><option value="nack">Nack every delivery</option><option value="expire">Let leases expire</option><option value="mixed">Deterministic mix</option></select></label>
+                </div>
+                <label class="field"><span>Run limit per worker</span><input id="worker-limit" type="number" value="5" min="1" max="100"></label>
+                <div class="worker-summary"><div><span>CLAIMED</span><strong id="workers-claimed">0</strong></div><div><span>ACKED</span><strong id="workers-acked">0</strong></div><div><span>FAILED</span><strong id="workers-failed">0</strong></div></div>
+                <button id="toggle-workers" class="button button-primary button-full" type="submit">Start workers</button>
+              </form>
+            </article>
+
+            <article class="panel activity-panel">
+              <header class="panel-header compact"><div><span class="panel-index">05</span><div><h3>API activity</h3><p>Receipts and secrets are redacted.</p></div></div><button id="clear-activity" class="button button-quiet" type="button">Clear</button></header>
+              <ol id="activity-log" class="activity-log" aria-live="polite" aria-relevant="additions"></ol>
+            </article>
+          </aside>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="create-queue-dialog" class="dialog">
+    <form id="create-queue-form" method="dialog">
+      <header><div><span class="eyebrow">IMMUTABLE POLICY</span><h2>Create queue</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close dialog">×</button></header>
+      <div class="dialog-body form-stack">
+        <label class="field"><span>Queue name</span><input id="queue-name" type="text" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9._-]*" placeholder="invoice-rendering" autocomplete="off"><small>Letters, numbers, period, underscore, and hyphen.</small></label>
+        <fieldset class="choice-group"><legend>Ordering</legend><label><input type="radio" name="ordering" value="fifo" checked><span><strong>FIFO</strong><small>Oldest eligible first</small></span></label><label><input type="radio" name="ordering" value="lifo"><span><strong>LIFO</strong><small>Newest eligible first</small></span></label></fieldset>
+        <label class="switch-row"><span><strong>Priority ordering</strong><small>Higher signed priority wins before sequence.</small></span><input id="queue-priority" type="checkbox" role="switch"></label>
+        <div class="form-row">
+          <label class="field"><span>Default delay</span><div class="input-unit"><input id="queue-delay" type="number" value="0" min="0"><span>ms</span></div></label>
+          <label class="field"><span>Default visibility</span><div class="input-unit"><input id="queue-visibility" type="number" value="5000" min="1"><span>ms</span></div></label>
+          <label class="field"><span>Max deliveries</span><input id="queue-max-deliveries" type="number" value="3" min="1" max="1000000"></label>
+        </div>
+      </div>
+      <footer><button class="button button-secondary" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit">Create queue</button></footer>
+    </form>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" aria-live="assertive" aria-atomic="true"></div>
+</body>
+</html>
