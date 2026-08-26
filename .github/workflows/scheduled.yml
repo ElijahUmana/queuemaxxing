@@ -71,6 +71,33 @@ jobs:
           path: artifacts/
           if-no-files-found: ignore
 
+  load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go install go.k6.io/k6@latest
+      - run: make build-server
+      - name: Run full queue soak
+        shell: bash
+        run: |
+          mkdir -p artifacts/load data/load
+          ./bin/qmax -listen 127.0.0.1:8080 -data-dir data/load >artifacts/load/qmax.stdout 2>artifacts/load/qmax.stderr &
+          echo $! > artifacts/load/qmax.pid
+          timeout 30s sh -c 'until curl --fail --silent http://127.0.0.1:8080/health/ready; do sleep 0.05; done'
+          QMAX_TEST_URL=http://127.0.0.1:8080 QMAX_DURATION=30m k6 run --summary-export artifacts/load/summary.json test/load/soak.js | tee artifacts/load/k6.log
+      - name: Upload load evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-${{ github.run_attempt }}
+          path: artifacts/load/
+          if-no-files-found: error
+
   benchmark:
     runs-on: ubuntu-latest
     timeout-minutes: 45

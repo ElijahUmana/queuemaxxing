@@ -56,7 +56,15 @@ jobs:
       - run: go install github.com/securego/gosec/v2/cmd/gosec@latest
       - run: govulncheck ./...
       - run: staticcheck ./...
-      - run: gosec ./...
+      - name: Security scan
+        run: mkdir -p artifacts/security && gosec -fmt=json -out=artifacts/security/gosec.json ./...
+      - name: Upload security evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-${{ github.run_attempt }}
+          path: artifacts/security/
+          if-no-files-found: ignore
 
   browser:
     runs-on: ubuntu-latest

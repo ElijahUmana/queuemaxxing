@@ -6,7 +6,12 @@ artifact_dir=${ARTIFACT_DIR:-"$repo_dir/artifacts"}
 mkdir -p "$artifact_dir"
 
 new_results="$artifact_dir/bench-new.txt"
-go -C "$repo_dir" test ./... -run '^$' -bench . -benchmem -count 10 > "$new_results"
+go -C "$repo_dir" test ./... -run '^$' -bench . -benchmem -benchtime="${BENCH_TIME:-10x}" -count "${BENCH_COUNT:-1}" > "$new_results"
+
+if ! grep -q '^Benchmark' "$new_results"; then
+  printf '%s\n' "no benchmarks were executed" >&2
+  exit 1
+fi
 
 if [ -n "${BENCH_BASELINE:-}" ]; then
   command -v benchstat >/dev/null 2>&1 || {
