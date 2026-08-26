@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -891,10 +890,6 @@ func compareMessages(left, right *model.Message, config model.QueueConfig) bool 
 		return left.Sequence > right.Sequence
 	}
 	return left.Sequence < right.Sequence
-}
-
-func sortMessages(messages []model.Message, config model.QueueConfig) {
-	sort.Slice(messages, func(i, j int) bool { return compareMessages(&messages[i], &messages[j], config) })
 }
 
 func encodeCursor(sequence uint64) string { return fmt.Sprintf("%020d", sequence) }

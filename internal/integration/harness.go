@@ -49,6 +49,7 @@ func StartProcess(ctx context.Context, binary string, args []string, environment
 	if err := os.MkdirAll(artifacts, 0o700); err != nil {
 		return nil, fmt.Errorf("create artifact directory: %w", err)
 	}
+	// #nosec G204 -- binary and args are supplied only by repository-owned integration tests.
 	command := exec.CommandContext(ctx, binary, args...)
 	command.Env = append([]string{}, os.Environ()...)
 	for key, value := range environment {
@@ -247,6 +248,7 @@ func (journal *OperationJournal) Write(path string) error {
 }
 
 func CopyAndTruncate(source, destination string, size int64) error {
+	// #nosec G304,G703 -- source and destination are test-owned temporary artifact paths.
 	contents, err := os.ReadFile(source)
 	if err != nil {
 		return err
@@ -254,6 +256,7 @@ func CopyAndTruncate(source, destination string, size int64) error {
 	if size < 0 || size > int64(len(contents)) {
 		return fmt.Errorf("truncation size %d outside [0,%d]", size, len(contents))
 	}
+	// #nosec G304,G703 -- destination is a test-owned temporary artifact path.
 	return os.WriteFile(destination, contents[:size], 0o600)
 }
 
@@ -261,6 +264,7 @@ func CopyAndFlipBit(source, destination string, byteOffset int64, bit uint8) err
 	if bit > 7 {
 		return fmt.Errorf("bit %d outside [0,7]", bit)
 	}
+	// #nosec G304,G703 -- source and destination are test-owned temporary artifact paths.
 	contents, err := os.ReadFile(source)
 	if err != nil {
 		return err
@@ -269,6 +273,7 @@ func CopyAndFlipBit(source, destination string, byteOffset int64, bit uint8) err
 		return fmt.Errorf("byte offset %d outside [0,%d)", byteOffset, len(contents))
 	}
 	contents[byteOffset] ^= 1 << bit
+	// #nosec G304,G703 -- destination is a test-owned temporary artifact path.
 	return os.WriteFile(destination, contents, 0o600)
 }
 
@@ -281,6 +286,7 @@ func ReadPhase(reader io.Reader) (string, error) {
 }
 
 func ChildHelperCommand(testBinary, testName string, environment map[string]string) *exec.Cmd {
+	// #nosec G204 -- testBinary and testName are fixed by repository-owned subprocess tests.
 	command := exec.Command(testBinary, "-test.run", "^"+testName+"$")
 	command.Env = append(os.Environ(), "QUEUE_TEST_CHILD=1")
 	for key, value := range environment {

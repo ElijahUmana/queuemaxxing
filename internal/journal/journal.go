@@ -159,7 +159,7 @@ func Open(config Config) (*FileJournal, error) {
 		nextLSN:     1,
 	}
 	if err := journal.open(); err != nil {
-		_ = lock.Close()
+		_ = journal.Close()
 		return nil, err
 	}
 	return journal, nil
@@ -450,6 +450,7 @@ func (journal *FileJournal) Checkpoint(ctx context.Context, throughLSN uint64, p
 	path := filepath.Join(journal.snapshotDir, snapshotName(generation, throughLSN))
 	temporary := path + ".tmp"
 	encoded := encodeSnapshot(journal.storeID, snapshot)
+	// #nosec G304 -- temporary is a generated snapshot filename beneath the fixed snapshot directory.
 	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return journal.failLocked("create snapshot", err)
@@ -470,6 +471,7 @@ func (journal *FileJournal) Checkpoint(ctx context.Context, throughLSN uint64, p
 	if err := file.Close(); err != nil {
 		return journal.failLocked("close snapshot", err)
 	}
+	// #nosec G304 -- temporary is the same internally generated snapshot path written above.
 	contents, err := os.ReadFile(temporary)
 	if err != nil {
 		return journal.failLocked("verify snapshot", err)
@@ -657,6 +659,7 @@ func (journal *FileJournal) rotateLocked() error {
 func (journal *FileJournal) createSegment(id, firstLSN uint64, previous [32]byte) error {
 	path := filepath.Join(journal.walDir, segmentName(id))
 	temporary := path + ".tmp"
+	// #nosec G304 -- temporary is a generated segment filename beneath the fixed WAL directory.
 	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return fmt.Errorf("create WAL segment: %w", err)
@@ -690,6 +693,7 @@ func (journal *FileJournal) createSegment(id, firstLSN uint64, previous [32]byte
 	if err := journal.syncDirectoryLocked(journal.walDir); err != nil {
 		return err
 	}
+	// #nosec G304 -- path is the generated segment path beneath the fixed WAL directory.
 	file, err = os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
@@ -739,14 +743,19 @@ func decodeSegmentHeader(path string, encoded []byte) (segmentHeader, error) {
 }
 
 func encodeRecord(record Record) []byte {
+	if len(record.Payload) > int(maxPayloadSize) {
+		panic("journal record payload exceeds maximum size")
+	}
 	encoded := make([]byte, recordHeaderSize+len(record.Payload)+recordTrailerSize)
+	payloadLength := uint32(len(record.Payload)) // #nosec G115 -- bounded by maxPayloadSize above.
+	totalLength := uint32(len(encoded))          // #nosec G115 -- fixed overhead plus bounded payload.
 	binary.LittleEndian.PutUint32(encoded[0:4], recordMagic)
 	binary.LittleEndian.PutUint16(encoded[4:6], formatVersion)
 	binary.LittleEndian.PutUint16(encoded[6:8], recordKindData)
 	binary.LittleEndian.PutUint16(encoded[8:10], 0)
 	binary.LittleEndian.PutUint16(encoded[10:12], recordHeaderSize)
-	binary.LittleEndian.PutUint32(encoded[12:16], uint32(len(record.Payload)))
-	binary.LittleEndian.PutUint32(encoded[16:20], ^uint32(len(record.Payload)))
+	binary.LittleEndian.PutUint32(encoded[12:16], payloadLength)
+	binary.LittleEndian.PutUint32(encoded[16:20], ^payloadLength)
 	binary.LittleEndian.PutUint64(encoded[20:28], record.LSN)
 	copy(encoded[28:44], record.TransactionID[:])
 	binary.LittleEndian.PutUint32(encoded[44:48], crc32.Checksum(encoded[:44], crcTable))
@@ -756,7 +765,7 @@ func encodeRecord(record Record) []byte {
 	_, _ = checksum.Write(encoded[:44])
 	_, _ = checksum.Write(record.Payload)
 	binary.LittleEndian.PutUint32(encoded[trailer:trailer+4], checksum.Sum32())
-	binary.LittleEndian.PutUint32(encoded[trailer+4:trailer+8], uint32(len(encoded)))
+	binary.LittleEndian.PutUint32(encoded[trailer+4:trailer+8], totalLength)
 	binary.LittleEndian.PutUint32(encoded[trailer+8:trailer+12], recordTrailerMagic)
 	return encoded
 }

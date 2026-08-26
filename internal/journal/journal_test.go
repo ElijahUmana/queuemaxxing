@@ -144,6 +144,11 @@ func TestRecoveryQuarantinesSegmentBeyondDurableHead(t *testing.T) {
 		t.Fatal(err)
 	}
 	digest := sha256.Sum256(contents)
+	if err := journal.active.Close(); err != nil {
+		journal.mu.Unlock()
+		t.Fatal(err)
+	}
+	journal.active = nil
 	if err := journal.createSegment(journal.activeID+1, journal.nextLSN, digest); err != nil {
 		journal.mu.Unlock()
 		t.Fatal(err)

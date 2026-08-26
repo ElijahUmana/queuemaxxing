@@ -583,16 +583,16 @@ func validateJSONObject(encoded []byte) error {
 	decoder.UseNumber()
 	first, err := decoder.Token()
 	if err != nil {
-		return errors.New("The request body is not valid JSON.")
+		return errors.New("request body is not valid JSON")
 	}
 	if delimiter, ok := first.(json.Delim); !ok || delimiter != '{' {
-		return errors.New("The top-level JSON value must be an object.")
+		return errors.New("top-level JSON value must be an object")
 	}
 	if err := consumeObject(decoder); err != nil {
 		return err
 	}
 	if _, err := decoder.Token(); err != io.EOF {
-		return errors.New("The request body must contain exactly one JSON object.")
+		return errors.New("request body must contain exactly one JSON object")
 	}
 	return nil
 }
@@ -602,14 +602,14 @@ func consumeObject(decoder *json.Decoder) error {
 	for decoder.More() {
 		token, err := decoder.Token()
 		if err != nil {
-			return errors.New("The request body is not valid JSON.")
+			return errors.New("request body is not valid JSON")
 		}
 		key, ok := token.(string)
 		if !ok {
-			return errors.New("The request body is not valid JSON.")
+			return errors.New("request body is not valid JSON")
 		}
 		if _, duplicate := keys[key]; duplicate {
-			return fmt.Errorf("The JSON field %q appears more than once.", key)
+			return fmt.Errorf("JSON field %q appears more than once", key)
 		}
 		keys[key] = struct{}{}
 		if err := consumeValue(decoder); err != nil {
@@ -617,7 +617,7 @@ func consumeObject(decoder *json.Decoder) error {
 		}
 	}
 	if _, err := decoder.Token(); err != nil {
-		return errors.New("The request body is not valid JSON.")
+		return errors.New("request body is not valid JSON")
 	}
 	return nil
 }
@@ -625,7 +625,7 @@ func consumeObject(decoder *json.Decoder) error {
 func consumeValue(decoder *json.Decoder) error {
 	token, err := decoder.Token()
 	if err != nil {
-		return errors.New("The request body is not valid JSON.")
+		return errors.New("request body is not valid JSON")
 	}
 	delimiter, ok := token.(json.Delim)
 	if !ok {
@@ -641,11 +641,11 @@ func consumeValue(decoder *json.Decoder) error {
 			}
 		}
 		if _, err := decoder.Token(); err != nil {
-			return errors.New("The request body is not valid JSON.")
+			return errors.New("request body is not valid JSON")
 		}
 		return nil
 	default:
-		return errors.New("The request body is not valid JSON.")
+		return errors.New("request body is not valid JSON")
 	}
 }
 

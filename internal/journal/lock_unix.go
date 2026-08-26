@@ -14,6 +14,7 @@ type directoryLock struct {
 }
 
 func acquireDirectoryLock(path string) (*directoryLock, error) {
+	// #nosec G304 -- path is the fixed LOCK filename under the operator-selected store root.
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open journal lock: %w", err)

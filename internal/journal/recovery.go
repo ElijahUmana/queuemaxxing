@@ -94,13 +94,14 @@ func (journal *FileJournal) recoverSegments(paths []string, snapshots []snapshot
 	}
 	firstName := segmentName(head.WALFloor)
 	lastName := segmentName(head.WALHead)
-	if filepath.Base(paths[0]) != firstName || filepath.Base(paths[len(paths)-1]) != lastName || len(paths) != int(head.WALHead-head.WALFloor+1) {
+	if filepath.Base(paths[0]) != firstName || filepath.Base(paths[len(paths)-1]) != lastName {
 		return nil, nil, storeID, &CorruptionError{Path: journal.walDir, LSN: head.DurableLSN, Reason: fmt.Sprintf("WAL segment range mismatch: expected %s through %s", firstName, lastName)}
 	}
 	expectedSegmentID := head.WALFloor
 	expectedLSN := head.SnapshotThroughLSN + 1
 	snapshotThroughLSN := head.SnapshotThroughLSN
 	for index, path := range paths {
+		// #nosec G304 -- path comes from segmentPaths after strict 20-digit WAL filename validation.
 		contents, err := os.ReadFile(path)
 		if err != nil {
 			return nil, nil, storeID, fmt.Errorf("read WAL segment %s: %w", path, err)
@@ -257,8 +258,10 @@ func (journal *FileJournal) repairTail(path string, offset int64, suffix []byte)
 			return err
 		}
 		quarantinePath := filepath.Join(quarantineDir, fmt.Sprintf("%s-%d.bad", filepath.Base(path), offset))
+		// #nosec G304,G703 -- quarantinePath is beneath the locked store and contains only filepath.Base of a validated WAL path.
 		file, err := os.OpenFile(quarantinePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if os.IsExist(err) {
+			// #nosec G304,G703 -- same fixed quarantine path checked above; read verifies existing crash evidence.
 			existing, readErr := os.ReadFile(quarantinePath)
 			if readErr != nil {
 				return readErr
@@ -294,6 +297,7 @@ func (journal *FileJournal) repairTail(path string, offset int64, suffix []byte)
 			return err
 		}
 	}
+	// #nosec G304 -- path is an active WAL path produced by validated segment enumeration.
 	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		return err
@@ -306,14 +310,19 @@ func (journal *FileJournal) repairTail(path string, offset int64, suffix []byte)
 }
 
 func encodeSnapshot(storeID [16]byte, snapshot Snapshot) []byte {
+	if len(snapshot.Payload) > int(maxPayloadSize) {
+		panic("snapshot payload exceeds maximum size")
+	}
 	encoded := make([]byte, snapshotHeaderSize+len(snapshot.Payload)+snapshotTrailerSize)
+	payloadLength := uint32(len(snapshot.Payload)) // #nosec G115 -- bounded by maxPayloadSize above.
+	totalLength := uint32(len(encoded))            // #nosec G115 -- fixed overhead plus bounded payload.
 	copy(encoded[:8], snapshotMagic[:])
 	binary.LittleEndian.PutUint16(encoded[8:10], formatVersion)
 	binary.LittleEndian.PutUint16(encoded[10:12], snapshotHeaderSize)
 	binary.LittleEndian.PutUint64(encoded[12:20], snapshot.Generation)
 	binary.LittleEndian.PutUint64(encoded[20:28], snapshot.ThroughLSN)
-	binary.LittleEndian.PutUint32(encoded[28:32], uint32(len(snapshot.Payload)))
-	binary.LittleEndian.PutUint32(encoded[32:36], ^uint32(len(snapshot.Payload)))
+	binary.LittleEndian.PutUint32(encoded[28:32], payloadLength)
+	binary.LittleEndian.PutUint32(encoded[32:36], ^payloadLength)
 	copy(encoded[36:52], storeID[:])
 	binary.LittleEndian.PutUint32(encoded[52:56], crc32.Checksum(encoded[:52], crcTable))
 	copy(encoded[snapshotHeaderSize:], snapshot.Payload)
@@ -321,7 +330,7 @@ func encodeSnapshot(storeID [16]byte, snapshot Snapshot) []byte {
 	digest := sha256.Sum256(encoded[:trailer])
 	copy(encoded[trailer:trailer+32], digest[:])
 	binary.LittleEndian.PutUint64(encoded[trailer+32:trailer+40], snapshot.ThroughLSN)
-	binary.LittleEndian.PutUint32(encoded[trailer+40:trailer+44], uint32(len(encoded)))
+	binary.LittleEndian.PutUint32(encoded[trailer+40:trailer+44], totalLength)
 	binary.LittleEndian.PutUint32(encoded[trailer+44:trailer+48], snapshotEndMagic)
 	return encoded
 }
@@ -371,6 +380,7 @@ func (journal *FileJournal) loadSnapshots() ([]snapshotCandidate, error) {
 			continue
 		}
 		path := filepath.Join(journal.snapshotDir, entry.Name())
+		// #nosec G304 -- path is formed from a snapshotDir entry constrained to the .snap format.
 		contents, readErr := os.ReadFile(path)
 		if readErr != nil {
 			invalid = append(invalid, readErr)
@@ -411,6 +421,7 @@ func (journal *FileJournal) compactLocked() error {
 		if path == journal.activePath {
 			continue
 		}
+		// #nosec G304 -- path comes from segmentPaths after strict 20-digit WAL filename validation.
 		contents, err := os.ReadFile(path)
 		if err != nil {
 			return err
