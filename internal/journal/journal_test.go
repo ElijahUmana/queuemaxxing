@@ -154,6 +154,7 @@ func TestRecoveryQuarantinesSegmentBeyondDurableHead(t *testing.T) {
 	}
 
 	reopened := openTestJournal(t, Config{Dir: dir})
+	defer reopened.Close()
 	assertRecords(t, reopened.Records(), []Record{{LSN: 1, TransactionID: TransactionID{1}, Payload: []byte("committed")}})
 	quarantined, err := filepath.Glob(filepath.Join(dir, "quarantine", "*.uncommitted"))
 	if err != nil || len(quarantined) != 1 {
@@ -299,6 +300,7 @@ func TestOpenRecoversInterruptedInitialHeadPublication(t *testing.T) {
 		t.Fatalf("Open() error = %v, failed = %v", err, failed)
 	}
 	recovered := openTestJournal(t, Config{Dir: dir})
+	defer recovered.Close()
 	if lsn, err := recovered.Append(context.Background(), TransactionID{1}, []byte("first")); err != nil || lsn != 1 {
 		t.Fatalf("Append() = (%d, %v), want (1, nil)", lsn, err)
 	}
