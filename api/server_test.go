@@ -180,7 +180,7 @@ func TestDurationOverflowIsRejectedBeforeServiceCall(t *testing.T) {
 
 func TestEnqueuePreservesFieldPresence(t *testing.T) {
 	service := &fakeService{enqueue: func(_ context.Context, _ string, request model.EnqueueRequest) (model.Message, bool, error) {
-		if !request.PrioritySet || request.Priority != 0 || !request.DelaySet || request.Delay != 0 {
+		if request.Priority == nil || *request.Priority != 0 || request.Delay == nil || *request.Delay != 0 {
 			t.Fatalf("request did not preserve explicit zero values: %+v", request)
 		}
 		return model.Message{ID: "m", Payload: json.RawMessage(`{}`)}, false, nil
@@ -203,18 +203,31 @@ func TestEnqueueRejectsConflictingScheduleFields(t *testing.T) {
 func TestReceiveTimeoutReturnsEmptyArray(t *testing.T) {
 	now := time.Date(2026, 8, 26, 20, 0, 0, 0, time.UTC)
 	service := &fakeService{receive: func(_ context.Context, _ string, request model.ReceiveRequest) (*model.Delivery, bool, error) {
-		if request.WaitTimeout != 20*time.Second || request.VisibilityTimeout != 30*time.Second {
+		if request.WaitTimeout != 20*time.Second || request.VisibilityTimeout != 30*time.Second || request.IdempotencyKey != "receive-key" {
 			t.Fatalf("request = %+v", request)
 		}
-		return nil, false, nil
+		return nil, true, nil
 	}}
 	server := newTestServer(t, service, Options{Now: func() time.Time { return now }})
-	response := perform(server, http.MethodPost, "/v1/queues/q/messages:receive", `{"wait_timeout_ms":20000,"visibility_timeout_ms":30000}`, "application/json")
+	request := httptest.NewRequest(http.MethodPost, "/v1/queues/q/messages:receive", strings.NewReader(`{"wait_timeout_ms":20000,"visibility_timeout_ms":30000}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "receive-key")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d", response.Code)
 	}
-	if !strings.Contains(response.Body.String(), `"messages":[]`) {
+	if !strings.Contains(response.Body.String(), `"messages":[]`) || !strings.Contains(response.Body.String(), `"replayed":true`) {
 		t.Fatalf("body = %s", response.Body.String())
+	}
+}
+
+func TestNackRejectsOversizedReason(t *testing.T) {
+	server := newTestServer(t, &fakeService{}, Options{})
+	body := `{"receipt_handle":"receipt","retry_delay_ms":0,"reason":"` + strings.Repeat("x", 513) + `"}`
+	response := perform(server, http.MethodPost, "/v1/queues/q/messages/m/nack", body, "application/json")
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 }
 
@@ -233,6 +246,10 @@ func TestListQueryIsStrictAndTranslated(t *testing.T) {
 	response = perform(server, http.MethodGet, "/v1/queues/q/messages?limit=1&limit=2", "", "")
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("duplicate query status = %d", response.Code)
+	}
+	response = perform(server, http.MethodGet, "/v1/queues/q/messages?limit=51", "", "")
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("oversized page status = %d", response.Code)
 	}
 }
 

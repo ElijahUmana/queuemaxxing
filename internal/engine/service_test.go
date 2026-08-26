@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -14,15 +15,20 @@ import (
 )
 
 type memoryJournal struct {
-	mu       sync.Mutex
-	records  []journal.Record
-	snapshot journal.Snapshot
-	closed   bool
+	mu              sync.Mutex
+	records         []journal.Record
+	snapshot        journal.Snapshot
+	closed          bool
+	appendError     error
+	checkpointError error
 }
 
 func (store *memoryJournal) Append(ctx context.Context, transaction journal.TransactionID, payload []byte) (uint64, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if store.appendError != nil {
+		return 0, store.appendError
+	}
 	lsn := uint64(len(store.records)) + store.snapshot.ThroughLSN + 1
 	store.records = append(store.records, journal.Record{LSN: lsn, TransactionID: transaction, Payload: append([]byte(nil), payload...)})
 	return lsn, nil
@@ -41,6 +47,9 @@ func (store *memoryJournal) AppendBatch(ctx context.Context, records []journal.R
 func (store *memoryJournal) Checkpoint(ctx context.Context, through uint64, payload []byte) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if store.checkpointError != nil {
+		return store.checkpointError
+	}
 	store.snapshot = journal.Snapshot{Generation: store.snapshot.Generation + 1, ThroughLSN: through, Payload: append([]byte(nil), payload...)}
 	kept := store.records[:0]
 	for _, record := range store.records {
@@ -147,7 +156,15 @@ func newTestService(t *testing.T, ordering model.Ordering, priority bool, maxDel
 
 func enqueueTest(t *testing.T, engine *service, payload string, priority int32, delay time.Duration, key string) model.Message {
 	t.Helper()
-	message, _, err := engine.Enqueue(context.Background(), "jobs", model.EnqueueRequest{Payload: json.RawMessage(payload), Priority: priority, Delay: delay, IdempotencyKey: key})
+	var requestedPriority *int32
+	if engine.state.Queues["jobs"].Config.PriorityEnabled {
+		requestedPriority = &priority
+	}
+	var requestedDelay *time.Duration
+	if delay != 0 {
+		requestedDelay = &delay
+	}
+	message, _, err := engine.Enqueue(context.Background(), "jobs", model.EnqueueRequest{Payload: json.RawMessage(payload), Priority: requestedPriority, Delay: requestedDelay, IdempotencyKey: key})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,6 +425,60 @@ func TestConcurrentEnqueueSequencesAreUnique(t *testing.T) {
 	}
 	if len(seen) != count {
 		t.Fatalf("unique sequences = %d", len(seen))
+	}
+}
+
+func TestPersistenceFailureRollsBackMutation(t *testing.T) {
+	engine, store, _ := newTestService(t, model.FIFO, false, 3)
+	store.appendError = errors.New("disk full")
+	_, _, err := engine.Enqueue(context.Background(), "jobs", model.EnqueueRequest{Payload: json.RawMessage(`{}`), IdempotencyKey: "failed"})
+	if !IsCode(err, CodeStorageUnavailable) {
+		t.Fatalf("enqueue error = %v", err)
+	}
+	page, pageErr := engine.ListMessages(context.Background(), "jobs", model.ListFilter{})
+	if pageErr != nil || len(page.Messages) != 0 || engine.totalMessages != 0 {
+		t.Fatalf("rolled back state = %#v, total=%d, err=%v", page, engine.totalMessages, pageErr)
+	}
+}
+
+func TestCheckpointFailureLeavesLiveStateUnchanged(t *testing.T) {
+	engine, store, clock := newTestService(t, model.FIFO, false, 1)
+	message := enqueueTest(t, engine, `{}`, 0, 0, "message")
+	delivery := receiveTest(t, engine, "receive")
+	clock.Advance(time.Minute)
+	store.checkpointError = errors.New("disk full")
+	if err := engine.Compact(context.Background()); !IsCode(err, CodeStorageUnavailable) {
+		t.Fatalf("compact error = %v", err)
+	}
+	engine.mu.Lock()
+	stored := engine.state.Queues["jobs"].Messages[message.ID]
+	receipt := engine.state.Queues["jobs"].Receipts[message.ID]
+	engine.mu.Unlock()
+	if stored.State != model.StateLeased || receipt != delivery.Receipt {
+		t.Fatalf("checkpoint failure mutated live state: %#v receipt=%q", stored, receipt)
+	}
+}
+
+func TestExpiredFinalLeaseCanBeRedriven(t *testing.T) {
+	engine, _, clock := newTestService(t, model.FIFO, false, 1)
+	message := enqueueTest(t, engine, `{}`, 0, 0, "message")
+	receiveTest(t, engine, "receive")
+	clock.Advance(time.Minute)
+	result, _, err := engine.Redrive(context.Background(), "jobs", model.RedriveRequest{MessageID: message.ID, IdempotencyKey: "redrive"})
+	if err != nil || result.Source.State != model.StateDead || result.Child.ReplayOf != message.ID {
+		t.Fatalf("redrive = %#v, %v", result, err)
+	}
+}
+
+func TestMutationResponsesCarryDurableLSN(t *testing.T) {
+	engine, _, _ := newTestService(t, model.FIFO, false, 3)
+	message := enqueueTest(t, engine, `{}`, 0, 0, "message")
+	if message.LastLSN == 0 {
+		t.Fatal("enqueue response omitted durable LSN")
+	}
+	delivery := receiveTest(t, engine, "receive")
+	if delivery.Message.LastLSN <= message.LastLSN {
+		t.Fatalf("receive LSN %d <= enqueue LSN %d", delivery.Message.LastLSN, message.LastLSN)
 	}
 }
 

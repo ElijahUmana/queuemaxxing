@@ -16,7 +16,7 @@ import (
 	"github.com/ElijahUmana/queuemaxxing/api"
 )
 
-const defaultMaxResponseBytes = int64(4 << 20)
+const defaultMaxResponseBytes = int64(64 << 20)
 
 type ListFilter struct {
 	State  api.MessageState
@@ -100,7 +100,11 @@ func (client *Client) Enqueue(ctx context.Context, queue string, request api.Enq
 }
 
 func (client *Client) Receive(ctx context.Context, queue string, request api.ReceiveRequest) (api.ReceiveResponse, error) {
-	return doJSON[api.ReceiveResponse](client, ctx, http.MethodPost, path("/v1/queues", queue, "messages:receive"), nil, request, "")
+	return client.ReceiveIdempotent(ctx, queue, request, "")
+}
+
+func (client *Client) ReceiveIdempotent(ctx context.Context, queue string, request api.ReceiveRequest, idempotencyKey string) (api.ReceiveResponse, error) {
+	return doJSON[api.ReceiveResponse](client, ctx, http.MethodPost, path("/v1/queues", queue, "messages:receive"), nil, request, idempotencyKey)
 }
 
 func (client *Client) Ack(ctx context.Context, queue, messageID, receipt, idempotencyKey string) (api.AckResponse, error) {

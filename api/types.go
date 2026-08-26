@@ -142,12 +142,13 @@ type MutationResponse[T any] struct {
 type ReceiveResponse struct {
 	Messages []Delivery `json:"messages"`
 	PolledAt time.Time  `json:"polled_at"`
+	Replayed bool       `json:"replayed"`
 }
 
 type AckResponse struct {
-	MessageID string `json:"message_id"`
-	State     string `json:"state"`
-	Replayed  bool   `json:"replayed"`
+	MessageID string       `json:"message_id"`
+	State     MessageState `json:"state"`
+	Replayed  bool         `json:"replayed"`
 }
 
 type MessagePage struct {

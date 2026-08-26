@@ -24,6 +24,8 @@ import (
 const (
 	defaultMaxRequestBytes = int64(1<<20) + 64<<10
 	defaultRequestTimeout  = 35 * time.Second
+	defaultListLimit       = 50
+	maxListLimit           = 50
 	problemBase            = "urn:queuemaxxing:problem:"
 )
 
@@ -33,7 +35,6 @@ type Options struct {
 	RequestTimeout  time.Duration
 	Now             func() time.Time
 	RequestID       func() string
-	AllowedOrigin   string
 }
 
 type Server struct {
@@ -43,8 +44,8 @@ type Server struct {
 	requestTimeout  time.Duration
 	now             func() time.Time
 	requestID       func() string
-	allowedOrigin   string
 	draining        atomic.Bool
+	compacting      atomic.Bool
 	handler         http.Handler
 }
 
@@ -76,7 +77,6 @@ func New(service engine.Service, options Options) (*Server, error) {
 	server := &Server{
 		service: service, logger: options.Logger, maxRequestBytes: options.MaxRequestBytes,
 		requestTimeout: options.RequestTimeout, now: options.Now, requestID: options.RequestID,
-		allowedOrigin: options.AllowedOrigin,
 	}
 	server.handler = server.routes()
 	return server, nil
@@ -149,10 +149,6 @@ func (server *Server) middleware(next http.Handler) http.Handler {
 		response.Header().Set("X-Request-ID", requestID)
 		response.Header().Set("X-Content-Type-Options", "nosniff")
 		response.Header().Set("Cache-Control", "no-store")
-		if server.allowedOrigin != "" && request.Header.Get("Origin") == server.allowedOrigin {
-			response.Header().Set("Access-Control-Allow-Origin", server.allowedOrigin)
-			response.Header().Set("Vary", "Origin")
-		}
 		if server.draining.Load() && request.URL.Path != "/health/live" && request.URL.Path != "/health/ready" {
 			server.writeProblem(response, request, http.StatusServiceUnavailable, "draining", "Service is draining", "The service is not accepting new operations.")
 			return
@@ -275,13 +271,9 @@ func (server *Server) enqueue(response http.ResponseWriter, request *http.Reques
 			return
 		}
 	}
-	var priority int32
-	if input.Priority != nil {
-		priority = *input.Priority
-	}
 	message, replayed, err := server.service.Enqueue(request.Context(), request.PathValue("queue"), model.EnqueueRequest{
-		Payload: input.Payload, Priority: priority, PrioritySet: input.Priority != nil,
-		Delay: delay, DelaySet: input.DelayMS != nil, AvailableAt: input.AvailableAt, IdempotencyKey: key,
+		Payload: input.Payload, Priority: input.Priority,
+		Delay: durationPointer(delay, input.DelayMS != nil), AvailableAt: input.AvailableAt, IdempotencyKey: key,
 	})
 	if err != nil {
 		server.serviceProblem(response, request, err)
@@ -320,15 +312,19 @@ func (server *Server) receive(response http.ResponseWriter, request *http.Reques
 			return
 		}
 	}
-	delivery, found, err := server.service.Receive(request.Context(), request.PathValue("queue"), model.ReceiveRequest{
-		VisibilityTimeout: visibilityTimeout, WaitTimeout: waitTimeout,
+	key, ok := server.idempotencyKey(response, request, false)
+	if !ok {
+		return
+	}
+	delivery, replayed, err := server.service.Receive(request.Context(), request.PathValue("queue"), model.ReceiveRequest{
+		VisibilityTimeout: visibilityTimeout, WaitTimeout: waitTimeout, IdempotencyKey: key,
 	})
 	if err != nil {
 		server.serviceProblem(response, request, err)
 		return
 	}
-	result := ReceiveResponse{Messages: []Delivery{}, PolledAt: server.now().UTC()}
-	if found && delivery != nil {
+	result := ReceiveResponse{Messages: []Delivery{}, PolledAt: server.now().UTC(), Replayed: replayed}
+	if delivery != nil {
 		result.Messages = append(result.Messages, deliveryFromModel(*delivery))
 	}
 	server.writeJSON(response, http.StatusOK, result)
@@ -354,7 +350,7 @@ func (server *Server) ack(response http.ResponseWriter, request *http.Request) {
 		server.serviceProblem(response, request, err)
 		return
 	}
-	server.writeJSON(response, http.StatusOK, AckResponse{MessageID: request.PathValue("message"), State: "acked", Replayed: replayed})
+	server.writeJSON(response, http.StatusOK, AckResponse{MessageID: request.PathValue("message"), State: StateAcked, Replayed: replayed})
 }
 
 func (server *Server) nack(response http.ResponseWriter, request *http.Request) {
@@ -365,6 +361,10 @@ func (server *Server) nack(response http.ResponseWriter, request *http.Request) 
 	retryDelay, delayOK := milliseconds(input.RetryDelayMS)
 	if input.ReceiptHandle == "" || !delayOK {
 		server.validationProblem(response, request, "receipt_handle is required and retry_delay_ms must be in range")
+		return
+	}
+	if len([]byte(input.Reason)) > 512 {
+		server.validationProblem(response, request, "reason cannot exceed 512 bytes")
 		return
 	}
 	key, ok := server.idempotencyKey(response, request, false)
@@ -425,7 +425,6 @@ func (server *Server) listDeadLetters(response http.ResponseWriter, request *htt
 	if !ok {
 		return
 	}
-	filter.State = model.StateDead
 	page, err := server.service.ListDeadLetters(request.Context(), request.PathValue("queue"), filter)
 	if err != nil {
 		server.serviceProblem(response, request, err)
@@ -493,6 +492,11 @@ func (server *Server) compact(response http.ResponseWriter, request *http.Reques
 	if !server.decodeEmpty(response, request) {
 		return
 	}
+	if !server.compacting.CompareAndSwap(false, true) {
+		server.writeProblem(response, request, http.StatusConflict, "compaction_in_progress", "Compaction is already running", "Wait for the active compaction to complete.")
+		return
+	}
+	defer server.compacting.Store(false)
 	if err := server.service.Compact(request.Context()); err != nil {
 		server.serviceProblem(response, request, err)
 		return
@@ -513,19 +517,23 @@ func (server *Server) listFilter(response http.ResponseWriter, request *http.Req
 	if allowState {
 		allowed["state"] = true
 	}
-	if !server.rejectQuery(response, request, allowed) {
-		return model.ListFilter{}, false
+	query := request.URL.Query()
+	for key, values := range query {
+		if !allowed[key] || len(values) != 1 {
+			server.writeProblem(response, request, http.StatusBadRequest, "invalid_query", "Invalid query string", "Query parameters must be recognized and supplied once.")
+			return model.ListFilter{}, false
+		}
 	}
-	filter := model.ListFilter{Limit: 50, Cursor: request.URL.Query().Get("cursor")}
-	if raw := request.URL.Query().Get("limit"); raw != "" {
+	filter := model.ListFilter{Limit: defaultListLimit, Cursor: query.Get("cursor")}
+	if raw := query.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
-		if err != nil || limit < 1 || limit > 1000 {
-			server.validationProblem(response, request, "limit must be an integer from 1 through 1000")
+		if err != nil || limit < 1 || limit > maxListLimit {
+			server.validationProblem(response, request, "limit must be an integer from 1 through 50")
 			return model.ListFilter{}, false
 		}
 		filter.Limit = limit
 	}
-	if raw := request.URL.Query().Get("state"); raw != "" {
+	if raw := query.Get("state"); raw != "" {
 		filter.State = model.MessageState(raw)
 		switch filter.State {
 		case model.StateDelayed, model.StateReady, model.StateLeased, model.StateAcked, model.StateDead:
@@ -692,6 +700,13 @@ func (server *Server) idempotencyKey(response http.ResponseWriter, request *http
 		}
 	}
 	return key, true
+}
+
+func durationPointer(value time.Duration, present bool) *time.Duration {
+	if !present {
+		return nil
+	}
+	return &value
 }
 
 func milliseconds(value int64) (time.Duration, bool) {

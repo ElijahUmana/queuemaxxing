@@ -121,7 +121,7 @@ func (s *service) Enqueue(ctx context.Context, queueName string, request model.E
 	if len(request.Payload) > s.limits.MaxPayloadBytes {
 		return model.Message{}, false, capacity("payload exceeds configured limit")
 	}
-	if request.Delay < 0 || request.Delay > s.limits.MaxDelay {
+	if request.Delay != nil && (*request.Delay < 0 || *request.Delay > s.limits.MaxDelay) {
 		return model.Message{}, false, invalid("delay is outside configured bounds")
 	}
 	requestFingerprint, err := fingerprint(request)
@@ -139,16 +139,20 @@ func (s *service) Enqueue(ctx context.Context, queueName string, request model.E
 		if !exists {
 			return notFound("queue not found")
 		}
-		if !queue.Config.PriorityEnabled && (request.PrioritySet || request.Priority != 0) {
+		if !queue.Config.PriorityEnabled && request.Priority != nil {
 			return invalid("priority is disabled for this queue")
 		}
 		if queueMessageCount(queue) >= s.limits.MaxMessagesPerQueue || s.totalMessageCountLocked() >= s.limits.MaxMessages {
 			return capacity("message capacity exceeded")
 		}
 		now := s.clock.Now()
-		delay := request.Delay
-		if !request.DelaySet && delay == 0 {
-			delay = queue.Config.DefaultDelay
+		delay := queue.Config.DefaultDelay
+		if request.Delay != nil {
+			delay = *request.Delay
+		}
+		priority := int32(0)
+		if request.Priority != nil {
+			priority = *request.Priority
 		}
 		visibilityTime := availableAt(now, delay, request.AvailableAt)
 		messageID, idErr := newID()
@@ -160,7 +164,7 @@ func (s *service) Enqueue(ctx context.Context, queueName string, request model.E
 			state = model.StateDelayed
 		}
 		message := &model.Message{
-			ID: messageID, Queue: queueName, Payload: append(json.RawMessage(nil), request.Payload...), Priority: request.Priority,
+			ID: messageID, Queue: queueName, Payload: append(json.RawMessage(nil), request.Payload...), Priority: priority,
 			Sequence: s.state.NextSequence, EnqueuedAt: now, AvailableAt: visibilityTime, State: state,
 		}
 		s.state.NextSequence++
@@ -186,9 +190,9 @@ func (s *service) Receive(ctx context.Context, queueName string, request model.R
 	}
 	deadline := s.clock.Now().Add(request.WaitTimeout)
 	for {
-		delivery, found, wake, nextEvent, receiveErr := s.receiveOnce(ctx, queueName, request, requestFingerprint)
-		if receiveErr != nil || delivery != nil || found {
-			return delivery, found, receiveErr
+		delivery, replayed, wake, nextEvent, receiveErr := s.receiveOnce(ctx, queueName, request, requestFingerprint)
+		if receiveErr != nil || delivery != nil || replayed {
+			return delivery, replayed, receiveErr
 		}
 		if request.WaitTimeout == 0 {
 			return s.finishEmptyReceive(ctx, queueName, request, requestFingerprint)
@@ -295,7 +299,7 @@ func (s *service) receiveOnce(ctx context.Context, queueName string, request mod
 		return nil, false, nil, time.Time{}, &Error{Code: CodeStorageUnavailable, Message: "persist reservation", Cause: err}
 	}
 	s.notifyLocked()
-	return delivery, true, s.wake, time.Time{}, nil
+	return delivery, false, s.wake, time.Time{}, nil
 }
 
 func (s *service) Ack(ctx context.Context, queueName string, request model.AckRequest) (bool, error) {
@@ -440,13 +444,7 @@ func (s *service) Redrive(ctx context.Context, queueName string, request model.R
 			return notFound("message not found")
 		}
 		now := s.clock.Now()
-		if logicalState(source, now, queue.Config.MaxDeliveries) == model.StateDead && source.State != model.StateDead {
-			delete(queue.Receipts, source.ID)
-			clearLease(source)
-			source.State = model.StateDead
-			source.LastFailureReason = "visibility_timeout"
-			source.DeadAt = timePointer(now)
-		}
+		s.materializeLocked(queue, now)
 		if source.State != model.StateDead {
 			return conflict("only dead letters can be redriven")
 		}

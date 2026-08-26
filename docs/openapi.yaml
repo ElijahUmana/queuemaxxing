@@ -75,7 +75,7 @@ paths:
         '400': {$ref: '#/components/responses/Problem'}
         '422': {$ref: '#/components/responses/Problem'}
   /v1/queues/{queue}/messages:receive:
-    parameters: [{$ref: '#/components/parameters/Queue'}]
+    parameters: [{$ref: '#/components/parameters/Queue'}, {$ref: '#/components/parameters/OptionalIdempotencyKey'}]
     post:
       operationId: receive
       requestBody:
@@ -153,7 +153,7 @@ components:
     Message: {name: message, in: path, required: true, schema: {type: string, minLength: 1}}
     OptionalIdempotencyKey: {name: Idempotency-Key, in: header, required: false, schema: {type: string, minLength: 1, maxLength: 256}}
     RequiredIdempotencyKey: {name: Idempotency-Key, in: header, required: true, schema: {type: string, minLength: 1, maxLength: 256}}
-    Limit: {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 1000, default: 50}}
+    Limit: {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 50, default: 50}}
     Cursor: {name: cursor, in: query, required: false, schema: {type: string}}
     State: {name: state, in: query, required: false, schema: {$ref: '#/components/schemas/MessageState'}}
   requestBodies:
@@ -198,11 +198,15 @@ components:
         default_visibility_timeout_ms: {allOf: [{$ref: '#/components/schemas/Milliseconds'}, {minimum: 1}]}
         max_deliveries: {type: integer, format: int32, minimum: 1}
     QueueConfig:
-      allOf:
-        - {$ref: '#/components/schemas/CreateQueueRequest'}
-        - type: object
-          required: [created_at]
-          properties: {created_at: {$ref: '#/components/schemas/Timestamp'}}
+      required: [name, ordering, priority_enabled, default_delay_ms, default_visibility_timeout_ms, max_deliveries, created_at]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9._-]+$'}
+        ordering: {$ref: '#/components/schemas/Ordering'}
+        priority_enabled: {type: boolean}
+        default_delay_ms: {$ref: '#/components/schemas/Milliseconds'}
+        default_visibility_timeout_ms: {allOf: [{$ref: '#/components/schemas/Milliseconds'}, {minimum: 1}]}
+        max_deliveries: {type: integer, format: int32, minimum: 1}
+        created_at: {$ref: '#/components/schemas/Timestamp'}
     Queue:
       type: object
       additionalProperties: false
@@ -230,19 +234,20 @@ components:
       required: [receipt_handle]
       properties: {receipt_handle: {type: string, minLength: 1, writeOnly: true}}
     NackRequest:
-      allOf:
-        - {$ref: '#/components/schemas/ReceiptRequest'}
-        - type: object
-          additionalProperties: false
-          required: [retry_delay_ms]
-          properties: {retry_delay_ms: {$ref: '#/components/schemas/Milliseconds'}, reason: {type: string, maxLength: 512}}
+      type: object
+      additionalProperties: false
+      required: [receipt_handle, retry_delay_ms]
+      properties:
+        receipt_handle: {type: string, minLength: 1, writeOnly: true}
+        retry_delay_ms: {$ref: '#/components/schemas/Milliseconds'}
+        reason: {type: string, maxLength: 512}
     ExtendRequest:
-      allOf:
-        - {$ref: '#/components/schemas/ReceiptRequest'}
-        - type: object
-          additionalProperties: false
-          required: [visibility_timeout_ms]
-          properties: {visibility_timeout_ms: {allOf: [{$ref: '#/components/schemas/Milliseconds'}, {minimum: 1}]}}
+      type: object
+      additionalProperties: false
+      required: [receipt_handle, visibility_timeout_ms]
+      properties:
+        receipt_handle: {type: string, minLength: 1, writeOnly: true}
+        visibility_timeout_ms: {allOf: [{$ref: '#/components/schemas/Milliseconds'}, {minimum: 1}]}
     RedriveRequest:
       type: object
       additionalProperties: false
@@ -299,8 +304,8 @@ components:
     ReceiveResponse:
       type: object
       additionalProperties: false
-      required: [messages, polled_at]
-      properties: {messages: {type: array, maxItems: 1, items: {$ref: '#/components/schemas/Delivery'}}, polled_at: {$ref: '#/components/schemas/Timestamp'}}
+      required: [messages, polled_at, replayed]
+      properties: {messages: {type: array, maxItems: 1, items: {$ref: '#/components/schemas/Delivery'}}, polled_at: {$ref: '#/components/schemas/Timestamp'}, replayed: {type: boolean}}
     AckResponse:
       type: object
       additionalProperties: false
