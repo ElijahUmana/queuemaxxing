@@ -250,26 +250,13 @@ func (server *Server) enqueue(response http.ResponseWriter, request *http.Reques
 		server.validationProblem(response, request, "payload is required and cannot be null")
 		return
 	}
-	if input.DelayMS != nil && input.AvailableAt != nil {
-		server.validationProblem(response, request, "delay_ms and available_at are mutually exclusive")
-		return
-	}
-	if input.DelayMS != nil && *input.DelayMS < 0 {
-		server.validationProblem(response, request, "delay_ms cannot be negative")
+	delay, ok := server.schedule(response, request, input.DelayMS, input.AvailableAt)
+	if !ok {
 		return
 	}
 	key, ok := server.idempotencyKey(response, request, false)
 	if !ok {
 		return
-	}
-	var delay time.Duration
-	if input.DelayMS != nil {
-		var delayOK bool
-		delay, delayOK = milliseconds(*input.DelayMS)
-		if !delayOK {
-			server.validationProblem(response, request, "delay_ms is outside the allowed range")
-			return
-		}
 	}
 	message, replayed, err := server.service.Enqueue(request.Context(), request.PathValue("queue"), model.EnqueueRequest{
 		Payload: input.Payload, Priority: input.Priority,
@@ -438,26 +425,13 @@ func (server *Server) redrive(response http.ResponseWriter, request *http.Reques
 	if !server.decode(response, request, &input) {
 		return
 	}
-	if input.DelayMS != nil && input.AvailableAt != nil {
-		server.validationProblem(response, request, "delay_ms and available_at are mutually exclusive")
-		return
-	}
-	if input.DelayMS != nil && *input.DelayMS < 0 {
-		server.validationProblem(response, request, "delay_ms cannot be negative")
+	delay, ok := server.schedule(response, request, input.DelayMS, input.AvailableAt)
+	if !ok {
 		return
 	}
 	key, ok := server.idempotencyKey(response, request, true)
 	if !ok {
 		return
-	}
-	var delay time.Duration
-	if input.DelayMS != nil {
-		var delayOK bool
-		delay, delayOK = milliseconds(*input.DelayMS)
-		if !delayOK {
-			server.validationProblem(response, request, "delay_ms is outside the allowed range")
-			return
-		}
 	}
 	result, replayed, err := server.service.Redrive(request.Context(), request.PathValue("queue"), model.RedriveRequest{
 		MessageID: request.PathValue("message"), Priority: input.Priority, Delay: delay,
@@ -700,6 +674,22 @@ func (server *Server) idempotencyKey(response http.ResponseWriter, request *http
 		}
 	}
 	return key, true
+}
+
+func (server *Server) schedule(response http.ResponseWriter, request *http.Request, delayMS *int64, availableAt *time.Time) (time.Duration, bool) {
+	if delayMS != nil && availableAt != nil {
+		server.validationProblem(response, request, "delay_ms and available_at are mutually exclusive")
+		return 0, false
+	}
+	if delayMS == nil {
+		return 0, true
+	}
+	delay, ok := milliseconds(*delayMS)
+	if !ok {
+		server.validationProblem(response, request, "delay_ms is outside the allowed range")
+		return 0, false
+	}
+	return delay, true
 }
 
 func durationPointer(value time.Duration, present bool) *time.Duration {
