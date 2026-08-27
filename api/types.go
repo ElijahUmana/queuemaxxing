@@ -124,7 +124,6 @@ type Message struct {
 	LastFailureReason string          `json:"last_failure_reason,omitempty"`
 	DeadAt            *time.Time      `json:"dead_at,omitempty"`
 	ReplayOf          string          `json:"replay_of,omitempty"`
-	LastLSN           uint64          `json:"last_lsn,string"`
 }
 
 type Delivery struct {
@@ -202,7 +201,7 @@ func messageFromModel(message model.Message) Message {
 		Sequence: message.Sequence, EnqueuedAt: message.EnqueuedAt, AvailableAt: message.AvailableAt,
 		State: MessageState(message.State), DeliveryCount: message.DeliveryCount, LeasedAt: message.LeasedAt,
 		LeaseExpiresAt: message.LeaseUntil, LastFailureReason: message.LastFailureReason,
-		DeadAt: message.DeadAt, ReplayOf: message.ReplayOf, LastLSN: message.LastLSN,
+		DeadAt: message.DeadAt, ReplayOf: message.ReplayOf,
 	}
 }
 
@@ -214,10 +213,14 @@ func deliveryFromModel(delivery model.Delivery) Delivery {
 }
 
 func statsFromModel(stats model.ServiceStats) ServiceStats {
+	readOnlyReason := ""
+	if stats.ReadOnly {
+		readOnlyReason = "storage operation failed"
+	}
 	return ServiceStats{
 		Queues: stats.Queues, Messages: countsFromModel(stats.Messages), DurableLSN: stats.DurableLSN,
 		WALBytes: stats.WALBytes, SnapshotGeneration: stats.SnapshotGeneration,
-		LastSyncAt: stats.LastSyncAt, ReadOnly: stats.ReadOnly, ReadOnlyReason: stats.ReadOnlyReason,
+		LastSyncAt: stats.LastSyncAt, ReadOnly: stats.ReadOnly, ReadOnlyReason: readOnlyReason,
 	}
 }
 

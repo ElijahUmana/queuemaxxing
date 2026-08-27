@@ -12,29 +12,35 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ElijahUmana/queuemaxxing/internal/engine"
 	"github.com/ElijahUmana/queuemaxxing/internal/model"
 )
 
 const (
-	defaultMaxRequestBytes = int64(1<<20) + 64<<10
-	defaultRequestTimeout  = 35 * time.Second
-	defaultListLimit       = 50
-	maxListLimit           = 50
-	problemBase            = "urn:queuemaxxing:problem:"
+	defaultMaxRequestBytes       = int64(1<<20) + 64<<10
+	defaultRequestTimeout        = 35 * time.Second
+	defaultMaxConcurrentRequests = 256
+	defaultMaxLongPolls          = 64
+	defaultListLimit             = 50
+	maxListLimit                 = 50
+	problemBase                  = "urn:queuemaxxing:problem:"
 )
 
 type Options struct {
-	Logger          *slog.Logger
-	MaxRequestBytes int64
-	RequestTimeout  time.Duration
-	Now             func() time.Time
-	RequestID       func() string
+	Logger                *slog.Logger
+	MaxRequestBytes       int64
+	RequestTimeout        time.Duration
+	MaxConcurrentRequests int
+	MaxLongPolls          int
+	Now                   func() time.Time
+	RequestID             func() string
 }
 
 type Server struct {
@@ -42,6 +48,8 @@ type Server struct {
 	logger          *slog.Logger
 	maxRequestBytes int64
 	requestTimeout  time.Duration
+	requestPermits  chan struct{}
+	longPollPermits chan struct{}
 	now             func() time.Time
 	requestID       func() string
 	draining        atomic.Bool
@@ -68,6 +76,18 @@ func New(service engine.Service, options Options) (*Server, error) {
 	if options.RequestTimeout < 1 {
 		return nil, errors.New("request timeout must be positive")
 	}
+	if options.MaxConcurrentRequests == 0 {
+		options.MaxConcurrentRequests = defaultMaxConcurrentRequests
+	}
+	if options.MaxConcurrentRequests < 1 {
+		return nil, errors.New("maximum concurrent requests must be positive")
+	}
+	if options.MaxLongPolls == 0 {
+		options.MaxLongPolls = defaultMaxLongPolls
+	}
+	if options.MaxLongPolls < 1 {
+		return nil, errors.New("maximum long polls must be positive")
+	}
 	if options.Now == nil {
 		options.Now = time.Now
 	}
@@ -76,7 +96,8 @@ func New(service engine.Service, options Options) (*Server, error) {
 	}
 	server := &Server{
 		service: service, logger: options.Logger, maxRequestBytes: options.MaxRequestBytes,
-		requestTimeout: options.RequestTimeout, now: options.Now, requestID: options.RequestID,
+		requestTimeout: options.RequestTimeout, requestPermits: make(chan struct{}, options.MaxConcurrentRequests),
+		longPollPermits: make(chan struct{}, options.MaxLongPolls), now: options.Now, requestID: options.RequestID,
 	}
 	server.handler = server.routes()
 	return server, nil
@@ -149,11 +170,20 @@ func (server *Server) middleware(next http.Handler) http.Handler {
 		response.Header().Set("X-Request-ID", requestID)
 		response.Header().Set("X-Content-Type-Options", "nosniff")
 		response.Header().Set("Cache-Control", "no-store")
+		ctx := context.WithValue(request.Context(), requestIDKey{}, requestID)
+		request = request.WithContext(ctx)
 		if server.draining.Load() && request.URL.Path != "/health/live" && request.URL.Path != "/health/ready" {
 			server.writeProblem(response, request, http.StatusServiceUnavailable, "draining", "Service is draining", "The service is not accepting new operations.")
 			return
 		}
-		ctx := context.WithValue(request.Context(), requestIDKey{}, requestID)
+		if request.URL.Path != "/health/live" && request.URL.Path != "/health/ready" {
+			if !server.acquirePermit(server.requestPermits) {
+				server.capacityProblem(response, request)
+				return
+			}
+			defer server.releasePermit(server.requestPermits)
+		}
+		ctx = request.Context()
 		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 			var cancel context.CancelFunc
 			ctx, cancel = context.WithTimeout(ctx, server.requestTimeout)
@@ -165,8 +195,25 @@ func (server *Server) middleware(next http.Handler) http.Handler {
 
 type requestIDKey struct{}
 
-func (server *Server) live(response http.ResponseWriter, _ *http.Request) {
-	server.writeJSON(response, http.StatusOK, StatusResponse{Status: "ok"})
+func (server *Server) capacityProblem(response http.ResponseWriter, request *http.Request) {
+	server.serviceProblem(response, request, &engine.Error{Code: engine.CodeCapacityExceeded, Message: "Retry the operation after capacity becomes available."})
+}
+
+func (*Server) acquirePermit(permits chan struct{}) bool {
+	select {
+	case permits <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (*Server) releasePermit(permits chan struct{}) {
+	<-permits
+}
+
+func (server *Server) live(response http.ResponseWriter, request *http.Request) {
+	server.writeJSON(response, request, http.StatusOK, StatusResponse{Status: "ok"})
 }
 
 func (server *Server) ready(response http.ResponseWriter, request *http.Request) {
@@ -178,7 +225,7 @@ func (server *Server) ready(response http.ResponseWriter, request *http.Request)
 		server.writeProblem(response, request, http.StatusServiceUnavailable, "not_ready", "Service is not ready", "Durable queue storage is unavailable.")
 		return
 	}
-	server.writeJSON(response, http.StatusOK, StatusResponse{Status: "ready"})
+	server.writeJSON(response, request, http.StatusOK, StatusResponse{Status: "ready"})
 }
 
 func (server *Server) createQueue(response http.ResponseWriter, request *http.Request) {
@@ -210,7 +257,7 @@ func (server *Server) createQueue(response http.ResponseWriter, request *http.Re
 	if replayed {
 		status = http.StatusOK
 	}
-	server.writeJSON(response, status, MutationResponse[Queue]{Data: queueFromModel(info), Replayed: replayed})
+	server.writeJSON(response, request, status, MutationResponse[Queue]{Data: queueFromModel(info), Replayed: replayed})
 }
 
 func (server *Server) listQueues(response http.ResponseWriter, request *http.Request) {
@@ -226,7 +273,7 @@ func (server *Server) listQueues(response http.ResponseWriter, request *http.Req
 	for index := range queues {
 		result[index] = queueFromModel(queues[index])
 	}
-	server.writeJSON(response, http.StatusOK, QueueList{Queues: result})
+	server.writeJSON(response, request, http.StatusOK, QueueList{Queues: result})
 }
 
 func (server *Server) getQueue(response http.ResponseWriter, request *http.Request) {
@@ -238,7 +285,7 @@ func (server *Server) getQueue(response http.ResponseWriter, request *http.Reque
 		server.serviceProblem(response, request, err)
 		return
 	}
-	server.writeJSON(response, http.StatusOK, queueFromModel(info))
+	server.writeJSON(response, request, http.StatusOK, queueFromModel(info))
 }
 
 func (server *Server) enqueue(response http.ResponseWriter, request *http.Request) {
@@ -270,7 +317,7 @@ func (server *Server) enqueue(response http.ResponseWriter, request *http.Reques
 	if replayed {
 		status = http.StatusOK
 	}
-	server.writeJSON(response, status, MutationResponse[Message]{Data: messageFromModel(message), Replayed: replayed})
+	server.writeJSON(response, request, status, MutationResponse[Message]{Data: messageFromModel(message), Replayed: replayed})
 }
 
 func (server *Server) receive(response http.ResponseWriter, request *http.Request) {
@@ -303,6 +350,13 @@ func (server *Server) receive(response http.ResponseWriter, request *http.Reques
 	if !ok {
 		return
 	}
+	if waitTimeout > 0 {
+		if !server.acquirePermit(server.longPollPermits) {
+			server.capacityProblem(response, request)
+			return
+		}
+		defer server.releasePermit(server.longPollPermits)
+	}
 	delivery, replayed, err := server.service.Receive(request.Context(), request.PathValue("queue"), model.ReceiveRequest{
 		VisibilityTimeout: visibilityTimeout, WaitTimeout: waitTimeout, IdempotencyKey: key,
 	})
@@ -314,7 +368,7 @@ func (server *Server) receive(response http.ResponseWriter, request *http.Reques
 	if delivery != nil {
 		result.Messages = append(result.Messages, deliveryFromModel(*delivery))
 	}
-	server.writeJSON(response, http.StatusOK, result)
+	server.writeJSON(response, request, http.StatusOK, result)
 }
 
 func (server *Server) ack(response http.ResponseWriter, request *http.Request) {
@@ -337,7 +391,7 @@ func (server *Server) ack(response http.ResponseWriter, request *http.Request) {
 		server.serviceProblem(response, request, err)
 		return
 	}
-	server.writeJSON(response, http.StatusOK, AckResponse{MessageID: request.PathValue("message"), State: StateAcked, Replayed: replayed})
+	server.writeJSON(response, request, http.StatusOK, AckResponse{MessageID: request.PathValue("message"), State: StateAcked, Replayed: replayed})
 }
 
 func (server *Server) nack(response http.ResponseWriter, request *http.Request) {
@@ -366,7 +420,7 @@ func (server *Server) nack(response http.ResponseWriter, request *http.Request) 
 		server.serviceProblem(response, request, err)
 		return
 	}
-	server.writeJSON(response, http.StatusOK, MutationResponse[Message]{Data: messageFromModel(message), Replayed: replayed})
+	server.writeJSON(response, request, http.StatusOK, MutationResponse[Message]{Data: messageFromModel(message), Replayed: replayed})
 }
 
 func (server *Server) extend(response http.ResponseWriter, request *http.Request) {
@@ -391,7 +445,7 @@ func (server *Server) extend(response http.ResponseWriter, request *http.Request
 		server.serviceProblem(response, request, err)
 		return
 	}
-	server.writeJSON(response, http.StatusOK, MutationResponse[Delivery]{Data: deliveryFromModel(delivery), Replayed: replayed})
+	server.writeJSON(response, request, http.StatusOK, MutationResponse[Delivery]{Data: deliveryFromModel(delivery), Replayed: replayed})
 }
 
 func (server *Server) listMessages(response http.ResponseWriter, request *http.Request) {
@@ -404,7 +458,7 @@ func (server *Server) listMessages(response http.ResponseWriter, request *http.R
 		server.serviceProblem(response, request, err)
 		return
 	}
-	server.writeJSON(response, http.StatusOK, pageFromModel(page))
+	server.writeJSON(response, request, http.StatusOK, pageFromModel(page))
 }
 
 func (server *Server) listDeadLetters(response http.ResponseWriter, request *http.Request) {
@@ -417,7 +471,7 @@ func (server *Server) listDeadLetters(response http.ResponseWriter, request *htt
 		server.serviceProblem(response, request, err)
 		return
 	}
-	server.writeJSON(response, http.StatusOK, pageFromModel(page))
+	server.writeJSON(response, request, http.StatusOK, pageFromModel(page))
 }
 
 func (server *Server) redrive(response http.ResponseWriter, request *http.Request) {
@@ -445,7 +499,7 @@ func (server *Server) redrive(response http.ResponseWriter, request *http.Reques
 	if replayed {
 		status = http.StatusOK
 	}
-	server.writeJSON(response, status, MutationResponse[RedriveResult]{Data: RedriveResult{
+	server.writeJSON(response, request, status, MutationResponse[RedriveResult]{Data: RedriveResult{
 		Source: messageFromModel(result.Source), Child: messageFromModel(result.Child),
 	}, Replayed: replayed})
 }
@@ -459,7 +513,7 @@ func (server *Server) stats(response http.ResponseWriter, request *http.Request)
 		server.serviceProblem(response, request, err)
 		return
 	}
-	server.writeJSON(response, http.StatusOK, statsFromModel(stats))
+	server.writeJSON(response, request, http.StatusOK, statsFromModel(stats))
 }
 
 func (server *Server) compact(response http.ResponseWriter, request *http.Request) {
@@ -475,7 +529,7 @@ func (server *Server) compact(response http.ResponseWriter, request *http.Reques
 		server.serviceProblem(response, request, err)
 		return
 	}
-	server.writeJSON(response, http.StatusOK, StatusResponse{Status: "compacted"})
+	server.writeJSON(response, request, http.StatusOK, StatusResponse{Status: "compacted"})
 }
 
 func pageFromModel(page model.MessagePage) MessagePage {
@@ -491,12 +545,9 @@ func (server *Server) listFilter(response http.ResponseWriter, request *http.Req
 	if allowState {
 		allowed["state"] = true
 	}
-	query := request.URL.Query()
-	for key, values := range query {
-		if !allowed[key] || len(values) != 1 {
-			server.writeProblem(response, request, http.StatusBadRequest, "invalid_query", "Invalid query string", "Query parameters must be recognized and supplied once.")
-			return model.ListFilter{}, false
-		}
+	query, ok := server.parseQuery(response, request, allowed)
+	if !ok {
+		return model.ListFilter{}, false
 	}
 	filter := model.ListFilter{Limit: defaultListLimit, Cursor: query.Get("cursor")}
 	if raw := query.Get("limit"); raw != "" {
@@ -520,20 +571,35 @@ func (server *Server) listFilter(response http.ResponseWriter, request *http.Req
 }
 
 func (server *Server) rejectQuery(response http.ResponseWriter, request *http.Request, allowed map[string]bool) bool {
-	for key, values := range request.URL.Query() {
-		if !allowed[key] || len(values) != 1 {
-			server.writeProblem(response, request, http.StatusBadRequest, "invalid_query", "Invalid query string", "Query parameters must be recognized and supplied once.")
-			return false
+	_, ok := server.parseQuery(response, request, allowed)
+	return ok
+}
+
+func (server *Server) parseQuery(response http.ResponseWriter, request *http.Request, allowed map[string]bool) (url.Values, bool) {
+	query, err := url.ParseQuery(request.URL.RawQuery)
+	if err != nil {
+		server.writeProblem(response, request, http.StatusBadRequest, "invalid_query", "Invalid query string", "Query parameters must use valid percent encoding and separators.")
+		return nil, false
+	}
+	for key, values := range query {
+		if !allowed[key] || len(values) != 1 || values[0] == "" {
+			server.writeProblem(response, request, http.StatusBadRequest, "invalid_query", "Invalid query string", "Query parameters must be recognized, non-empty, and supplied once.")
+			return nil, false
 		}
 	}
-	return true
+	return query, true
 }
 
 func (server *Server) decode(response http.ResponseWriter, request *http.Request, destination any) bool {
 	if !server.rejectQuery(response, request, nil) {
 		return false
 	}
-	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	contentTypes := request.Header.Values("Content-Type")
+	if len(contentTypes) != 1 {
+		server.writeProblem(response, request, http.StatusUnsupportedMediaType, "unsupported_media_type", "Unsupported media type", "Supply exactly one Content-Type header with value application/json.")
+		return false
+	}
+	mediaType, _, err := mime.ParseMediaType(contentTypes[0])
 	if err != nil || mediaType != "application/json" {
 		server.writeProblem(response, request, http.StatusUnsupportedMediaType, "unsupported_media_type", "Unsupported media type", "Content-Type must be application/json.")
 		return false
@@ -552,6 +618,10 @@ func (server *Server) decode(response http.ResponseWriter, request *http.Request
 	}
 	if len(bytes.TrimSpace(encoded)) == 0 {
 		server.writeProblem(response, request, http.StatusBadRequest, "invalid_json", "Invalid JSON", "A JSON request body is required.")
+		return false
+	}
+	if !utf8.Valid(encoded) {
+		server.writeProblem(response, request, http.StatusBadRequest, "invalid_json", "Invalid JSON", "The request body must contain valid UTF-8.")
 		return false
 	}
 	if err := validateJSONObject(encoded); err != nil {
@@ -579,6 +649,9 @@ func (server *Server) decodeEmpty(response http.ResponseWriter, request *http.Re
 }
 
 func validateJSONObject(encoded []byte) error {
+	if err := validateSurrogateEscapes(encoded); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	decoder.UseNumber()
 	first, err := decoder.Token()
@@ -595,6 +668,64 @@ func validateJSONObject(encoded []byte) error {
 		return errors.New("request body must contain exactly one JSON object")
 	}
 	return nil
+}
+
+func validateSurrogateEscapes(encoded []byte) error {
+	inString := false
+	for index := 0; index < len(encoded); index++ {
+		switch encoded[index] {
+		case '"':
+			inString = !inString
+		case '\\':
+			if !inString || index+1 >= len(encoded) {
+				continue
+			}
+			index++
+			if encoded[index] != 'u' {
+				continue
+			}
+			value, ok := decodeHexQuad(encoded, index+1)
+			if !ok {
+				return errors.New("request body is not valid JSON")
+			}
+			index += 4
+			switch {
+			case value >= 0xd800 && value <= 0xdbff:
+				if index+6 >= len(encoded) || encoded[index+1] != '\\' || encoded[index+2] != 'u' {
+					return errors.New("JSON strings cannot contain unpaired Unicode surrogates")
+				}
+				low, valid := decodeHexQuad(encoded, index+3)
+				if !valid || low < 0xdc00 || low > 0xdfff {
+					return errors.New("JSON strings cannot contain unpaired Unicode surrogates")
+				}
+				index += 6
+			case value >= 0xdc00 && value <= 0xdfff:
+				return errors.New("JSON strings cannot contain unpaired Unicode surrogates")
+			}
+		}
+	}
+	return nil
+}
+
+func decodeHexQuad(encoded []byte, start int) (uint16, bool) {
+	if start+4 > len(encoded) {
+		return 0, false
+	}
+	var value uint16
+	for _, character := range encoded[start : start+4] {
+		value <<= 4
+		switch {
+		case character >= '0' && character <= '9':
+			value |= uint16(character - '0')
+		case character >= 'a' && character <= 'f':
+			value |= uint16(character-'a') + 10
+		case character >= 'A' && character <= 'F':
+			value |= uint16(character-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return value, true
 }
 
 func consumeObject(decoder *json.Decoder) error {
@@ -735,7 +866,7 @@ func (server *Server) serviceProblem(response http.ResponseWriter, request *http
 		status, code, title, detail = 499, "request_canceled", "Request canceled", "The request was canceled before completion."
 	}
 	if status >= 500 {
-		server.logger.Error("API operation failed", "request_id", requestIDFrom(request), "method", request.Method, "path", request.URL.Path, "code", code, "error", err)
+		server.logger.Error("API operation failed", "request_id", requestIDFrom(request), "method", request.Method, "code", code)
 	}
 	server.writeProblem(response, request, status, code, title, detail)
 }
@@ -745,20 +876,20 @@ func (server *Server) validationProblem(response http.ResponseWriter, request *h
 }
 
 func (server *Server) writeProblem(response http.ResponseWriter, request *http.Request, status int, code, title, detail string) {
-	server.writeJSON(response, status, Problem{
+	server.writeJSON(response, request, status, Problem{
 		Type: problemBase + code, Title: title, Status: status, Code: code, Detail: detail,
 		RequestID: requestIDFrom(request),
 	})
 }
 
-func (server *Server) writeJSON(response http.ResponseWriter, status int, value any) {
+func (server *Server) writeJSON(response http.ResponseWriter, request *http.Request, status int, value any) {
 	response.Header().Set("Content-Type", "application/json")
 	if _, ok := value.(Problem); ok {
 		response.Header().Set("Content-Type", "application/problem+json")
 	}
 	response.WriteHeader(status)
 	if err := json.NewEncoder(response).Encode(value); err != nil {
-		server.logger.Error("write API response", "error", err)
+		server.logger.Error("write API response", "request_id", requestIDFrom(request), "method", request.Method, "route", request.Pattern, "status", status, "error_type", fmt.Sprintf("%T", err))
 	}
 }
 
