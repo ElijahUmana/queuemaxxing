@@ -2349,20 +2349,8 @@ func TestMutationCoordinatorClosingVisibilityAndFinalization(t *testing.T) {
 	defer cancel()
 	closeResult := make(chan error, 1)
 	go func() { closeResult <- engine.Close(closeCtx) }()
-	for {
-		engine.mu.Lock()
-		closing := engine.closing
-		engine.mu.Unlock()
-		if closing {
-			break
-		}
+	for !engine.closing.Load() {
 		time.Sleep(time.Millisecond)
-	}
-	if err := engine.Ready(); !IsCode(err, CodeClosed) {
-		t.Fatalf("ready during close = %v", err)
-	}
-	if _, err := engine.ListQueues(context.Background()); !IsCode(err, CodeClosed) {
-		t.Fatalf("list during close = %v", err)
 	}
 	if err := <-closeResult; !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timed close = %v", err)
@@ -2370,6 +2358,12 @@ func TestMutationCoordinatorClosingVisibilityAndFinalization(t *testing.T) {
 	close(store.release)
 	if err := <-createDone; err != nil {
 		t.Fatal(err)
+	}
+	if err := engine.Ready(); !IsCode(err, CodeClosed) {
+		t.Fatalf("ready during close = %v", err)
+	}
+	if _, err := engine.ListQueues(context.Background()); !IsCode(err, CodeClosed) {
+		t.Fatalf("list during close = %v", err)
 	}
 	if err := engine.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -2610,6 +2604,21 @@ func TestRecoveredCapabilityInvariantMatrix(t *testing.T) {
 				t.Fatal("malformed state accepted")
 			}
 		})
+	}
+
+	longKeyState, err := cloneStateForCheckpoint(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(longKeyState.Idempotency, id)
+	record := base.Idempotency[id]
+	record.Key = "long"
+	longID := idempotencyID(record.Operation, record.Queue, record.Key)
+	longKeyState.Idempotency[longID] = record
+	service := &service{state: longKeyState, limits: DefaultLimits(), journal: &memoryJournal{records: []journal.Record{{LSN: 4}}}, clock: newFakeClock(now)}
+	service.limits.MaxIdempotencyKeyBytes = 3
+	if err := service.validateRecoveredState(); err == nil {
+		t.Fatal("overlong recovered idempotency key accepted")
 	}
 }
 

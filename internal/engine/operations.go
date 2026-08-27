@@ -272,6 +272,9 @@ func (s *service) Receive(ctx context.Context, queueName string, request model.R
 		case <-ctx.Done():
 			timer.Stop()
 			return nil, false, ctx.Err()
+		case <-s.closingCh:
+			timer.Stop()
+			return nil, false, &Error{Code: CodeClosed, Message: "queue service is closed"}
 		case <-wake:
 			timer.Stop()
 		case <-timer.C():
@@ -927,10 +930,8 @@ func (s *service) Close(ctx context.Context) error {
 	s.closeOnce.Do(func() {
 		s.submitMu.Lock()
 		s.stopping = true
-		s.mu.Lock()
-		s.closing = true
-		s.notifyLocked()
-		s.mu.Unlock()
+		s.closing.Store(true)
+		close(s.closingCh)
 		close(s.mutationStop)
 		s.submitMu.Unlock()
 		go func() {

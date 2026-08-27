@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	queueclock "github.com/ElijahUmana/queuemaxxing/internal/clock"
@@ -159,10 +160,11 @@ type service struct {
 	mutationStop    chan struct{}
 	mutationDone    chan struct{}
 	closeDone       chan struct{}
+	closingCh       chan struct{}
 	closeOnce       sync.Once
 	closeErr        error
 	stopping        bool
-	closing         bool
+	closing         atomic.Bool
 	closed          bool
 	totalMessages   int
 	totalWaiters    int
@@ -194,6 +196,7 @@ func New(store journal.Journal, serviceClock queueclock.Clock, options Options) 
 		mutationStop:    make(chan struct{}),
 		mutationDone:    make(chan struct{}),
 		closeDone:       make(chan struct{}),
+		closingCh:       make(chan struct{}),
 		waitersByQueue:  make(map[string]int),
 		inFlightByQueue: make(map[string]int),
 		state: persistedState{
@@ -1248,13 +1251,14 @@ func (s *service) processMutationGroup(requests []mutationRequest) int {
 	for index := range prepared {
 		records[index] = prepared[index].record
 	}
+	durableBefore := s.journal.Stats().DurableLSN
 	lsns, err := s.journal.AppendBatch(context.Background(), records)
 	if err == nil {
 		if len(lsns) != len(prepared) {
 			err = fmt.Errorf("journal returned %d LSNs for %d records", len(lsns), len(prepared))
 		} else {
 			for index, lsn := range lsns {
-				if lsn == 0 || index > 0 && lsn <= lsns[index-1] {
+				if lsn <= durableBefore || index > 0 && lsn <= lsns[index-1] {
 					err = fmt.Errorf("journal returned invalid LSN sequence %v", lsns)
 					break
 				}
@@ -1295,7 +1299,7 @@ func (s *service) notifyLocked() {
 }
 
 func (s *service) checkOpenLocked() error {
-	if s.closing || s.closed {
+	if s.closing.Load() || s.closed {
 		return &Error{Code: CodeClosed, Message: "queue service is closed"}
 	}
 	return nil
