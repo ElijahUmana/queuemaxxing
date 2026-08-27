@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ElijahUmana/queuemaxxing/internal/engine"
 	"github.com/ElijahUmana/queuemaxxing/internal/model"
@@ -906,6 +907,43 @@ func TestReceiveListAndScheduleValidationEdges(t *testing.T) {
 			t.Fatalf("%s %s = %d %s", test.method, test.target, response.Code, response.Body.String())
 		}
 	}
+}
+
+func FuzzStrictAPIParser(f *testing.F) {
+	for _, seed := range [][]byte{
+		[]byte(`{"payload":{}}`),
+		[]byte(`{"payload":{"nested":["\uD83D\uDE00"]}}`),
+		[]byte(`{"payload":{"\uD800":1}}`),
+		{'{', '"', 'p', 'a', 'y', 'l', 'o', 'a', 'd', '"', ':', '"', 0xff, '"', '}'},
+		[]byte(`{"payload":{"a":1,"a":2}}`),
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, body []byte) {
+		const maxFuzzBody = 4 << 10
+		if len(body) > maxFuzzBody {
+			body = body[:maxFuzzBody]
+		}
+		called := false
+		service := &fakeService{enqueue: func(_ context.Context, _ string, request model.EnqueueRequest) (model.Message, bool, error) {
+			called = true
+			if !json.Valid(request.Payload) || !utf8.Valid(request.Payload) {
+				t.Fatalf("invalid payload reached service: %q", request.Payload)
+			}
+			return model.Message{ID: "m", Queue: "q", Payload: append(json.RawMessage(nil), request.Payload...)}, false, nil
+		}}
+		server := newTestServer(t, service, Options{MaxRequestBytes: maxFuzzBody})
+		response := performBytes(server, http.MethodPost, "/v1/queues/q/messages", body, "application/json")
+		if response.Code == http.StatusCreated && !called {
+			t.Fatal("successful parse did not call service")
+		}
+		if response.Code != http.StatusCreated && called {
+			t.Fatalf("service called before rejected response %d", response.Code)
+		}
+		if response.Code < 400 && response.Code != http.StatusCreated {
+			t.Fatalf("unexpected status %d", response.Code)
+		}
+	})
 }
 
 func TestStrictParserAndRequestIDHelperBranches(t *testing.T) {
