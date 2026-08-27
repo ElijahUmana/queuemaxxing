@@ -23,6 +23,8 @@ jobs:
           cache: true
       - name: Verify format, vet, shuffled coverage, and race
         shell: bash
+        env:
+          SKIP_FORMAT_CHECK: ${{ runner.os == 'Windows' && '1' || '0' }}
         run: ./scripts/verify.sh
       - name: Real binary crash durability
         if: runner.os == 'Linux'
@@ -66,10 +68,14 @@ jobs:
         run: docker compose config --quiet
       - name: Build and start containers
         run: docker compose up --build --detach --wait --wait-timeout 120
-      - name: Verify health and mutation path
+      - name: Verify nonroot runtime and durable mutation
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p artifacts/container
+          uid=$(docker compose exec -T queue /busybox/sh -c 'id -u')
+          test "$uid" != "0"
+          printf '%s\n' "$uid" > artifacts/container/queue-uid.txt
           curl --fail --silent http://127.0.0.1:8080/health/ready
           curl --fail --silent http://127.0.0.1:8081/healthz
           curl --fail --silent --show-error \
@@ -80,29 +86,61 @@ jobs:
             --request POST http://127.0.0.1:8080/v1/queues/container-ci/messages \
             --header 'Content-Type: application/json' \
             --header 'Idempotency-Key: container-enqueue' \
-            --data '{"payload":{"source":"container-ci"}}'
-          curl --fail --silent --show-error \
-            --request POST http://127.0.0.1:8080/v1/queues/container-ci/messages:receive \
-            --header 'Content-Type: application/json' \
-            --data '{"visibility_timeout_ms":30000}' \
-            | tee container-receive.json
+            --data '{"payload":{"source":"container-ci"}}' \
+            | tee artifacts/container/enqueue-before-restart.json
           python3 - <<'PY'
           import json
           from pathlib import Path
 
-          data = json.loads(Path("container-receive.json").read_text())
-          assert len(data["messages"]) == 1
-          delivery = data["messages"][0]
-          assert delivery["message"]["payload"]["source"] == "container-ci"
-          Path("container-message-id.txt").write_text(delivery["message"]["id"])
-          Path("container-ack.json").write_text(json.dumps({"receipt_handle": delivery["receipt_handle"]}))
+          data = json.loads(Path("artifacts/container/enqueue-before-restart.json").read_text())
+          Path("artifacts/container/message-id.txt").write_text(data["data"]["id"])
           PY
-          message_id=$(cat container-message-id.txt)
+      - name: Recreate queue with named volume
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose stop queue
+          docker compose rm --force queue
+          docker compose up --detach --wait --wait-timeout 120 queue
+          curl --fail --silent http://127.0.0.1:8080/health/ready
+      - name: Verify persisted read, receive, and acknowledge
+        shell: bash
+        run: |
+          set -euo pipefail
+          message_id=$(cat artifacts/container/message-id.txt)
+          curl --fail --silent --show-error \
+            "http://127.0.0.1:8080/v1/queues/container-ci" \
+            | tee artifacts/container/queue-after-restart.json
+          curl --fail --silent --show-error \
+            "http://127.0.0.1:8080/v1/queues/container-ci/messages" \
+            | tee artifacts/container/messages-after-restart.json
+          curl --fail --silent --show-error \
+            --request POST http://127.0.0.1:8080/v1/queues/container-ci/messages:receive \
+            --header 'Content-Type: application/json' \
+            --data '{"visibility_timeout_ms":30000}' \
+            | tee artifacts/container/receive-after-restart.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          expected_id = Path("artifacts/container/message-id.txt").read_text()
+          queue = json.loads(Path("artifacts/container/queue-after-restart.json").read_text())
+          messages = json.loads(Path("artifacts/container/messages-after-restart.json").read_text())
+          received = json.loads(Path("artifacts/container/receive-after-restart.json").read_text())
+          assert queue["config"]["name"] == "container-ci"
+          assert any(message["id"] == expected_id for message in messages["messages"])
+          assert len(received["messages"]) == 1
+          delivery = received["messages"][0]
+          assert delivery["message"]["id"] == expected_id
+          assert delivery["message"]["payload"]["source"] == "container-ci"
+          Path("artifacts/container/ack-after-restart.json").write_text(json.dumps({"receipt_handle": delivery["receipt_handle"]}))
+          PY
           curl --fail --silent --show-error \
             --request POST "http://127.0.0.1:8080/v1/queues/container-ci/messages/${message_id}/ack" \
             --header 'Content-Type: application/json' \
-            --header 'Idempotency-Key: container-ack' \
-            --data @container-ack.json
+            --header 'Idempotency-Key: container-ack-after-restart' \
+            --data @artifacts/container/ack-after-restart.json \
+            | tee artifacts/container/ack-response.json
       - name: Capture container logs
         if: always()
         run: mkdir -p artifacts/container && docker compose logs --no-color > artifacts/container/compose.log

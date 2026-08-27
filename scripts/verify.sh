@@ -7,10 +7,12 @@ minimum=${MIN_COVERAGE:-90}
 profile="$artifact_dir/coverage.out"
 mkdir -p "$artifact_dir"
 
-unformatted=$(cd "$repo_dir" && gofmt -l .)
-if [ -n "$unformatted" ]; then
-  printf '%s\n' "$unformatted" >&2
-  exit 1
+if [ "${SKIP_FORMAT_CHECK:-0}" != "1" ]; then
+  unformatted=$(cd "$repo_dir" && gofmt -l .)
+  if [ -n "$unformatted" ]; then
+    printf '%s\n' "$unformatted" >&2
+    exit 1
+  fi
 fi
 
 go -C "$repo_dir" vet ./...
