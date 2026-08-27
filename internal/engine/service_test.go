@@ -2703,6 +2703,104 @@ func TestCursorSignedSecondExtremesRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRedriveFreezesPointerInputsBeforeQueuedExecution(t *testing.T) {
+	engine, _, clock := newTestService(t, model.FIFO, true, 1)
+	source := enqueueTest(t, engine, `{}`, 1, 0, "source")
+	delivery := receiveTest(t, engine, "receive")
+	if _, _, err := engine.Nack(context.Background(), "jobs", model.NackRequest{MessageID: source.ID, Receipt: delivery.Receipt}); err != nil {
+		t.Fatal(err)
+	}
+	priority := int32(7)
+	availableAt := clock.Now().Add(time.Minute)
+	frozen := freezeRedriveRequest(model.RedriveRequest{MessageID: source.ID, Priority: &priority, AvailableAt: &availableAt})
+	priority = 99
+	availableAt = clock.Now().Add(2 * time.Minute)
+	result, _, err := engine.Redrive(context.Background(), "jobs", frozen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Child.Priority != 7 || !result.Child.AvailableAt.Equal(clock.Now().Add(time.Minute)) {
+		t.Fatalf("redrive child = %+v", result.Child)
+	}
+}
+
+func TestCommittedEmptyReceiveIdempotencySurvivesRestart(t *testing.T) {
+	engine, store, clock := newTestService(t, model.FIFO, false, 3)
+	delivery, replayed, err := engine.Receive(context.Background(), "jobs", model.ReceiveRequest{IdempotencyKey: "empty"})
+	if err != nil || delivery != nil || replayed {
+		t.Fatalf("empty receive = %+v/%t, %v", delivery, replayed, err)
+	}
+	recoveredService, err := New(store, clock, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := recoveredService.(*service)
+	delivery, replayed, err = recovered.Receive(context.Background(), "jobs", model.ReceiveRequest{IdempotencyKey: "empty"})
+	if err != nil || delivery != nil || !replayed {
+		t.Fatalf("recovered empty replay = %+v/%t, %v", delivery, replayed, err)
+	}
+}
+
+func TestCoordinatorCanceledRequestNeverExecutesClosure(t *testing.T) {
+	engine, store, _ := newTestService(t, model.FIFO, false, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	executed := false
+	request := mutationRequest{ctx: ctx, queueName: "jobs", result: make(chan mutationResult, 1), mutation: func() error {
+		executed = true
+		return nil
+	}}
+	store.mu.Lock()
+	recordsBefore := len(store.records)
+	store.mu.Unlock()
+	engine.processMutationRequests([]mutationRequest{request})
+	result := <-request.result
+	store.mu.Lock()
+	recordsAfter := len(store.records)
+	store.mu.Unlock()
+	if !errors.Is(result.err, context.Canceled) || executed || recordsAfter != recordsBefore {
+		t.Fatalf("canceled request = result %+v executed=%t records=%d/%d", result, executed, recordsAfter, recordsBefore)
+	}
+}
+
+func TestMutationCoordinatorInternalFailureBranchesRollback(t *testing.T) {
+	t.Run("encode-error", func(t *testing.T) {
+		engine, _, _ := newTestService(t, model.FIFO, false, 3)
+		request := mutationRequest{ctx: context.Background(), queueName: "jobs", result: make(chan mutationResult, 1), mutation: func() error {
+			message := &model.Message{ID: "bad", Queue: "jobs", Payload: json.RawMessage{0xff}, Sequence: engine.state.NextSequence}
+			engine.state.NextSequence++
+			engine.state.Queues["jobs"].Messages[message.ID] = message
+			engine.totalMessages++
+			return nil
+		}}
+		engine.processMutationRequests([]mutationRequest{request})
+		if result := <-request.result; !IsCode(result.err, CodeStorageUnavailable) {
+			t.Fatalf("encode error result = %+v", result)
+		}
+		engine.mu.Lock()
+		_, exists := engine.state.Queues["jobs"].Messages["bad"]
+		engine.mu.Unlock()
+		if exists {
+			t.Fatal("encode failure retained speculative message")
+		}
+	})
+
+	t.Run("oversized-record", func(t *testing.T) {
+		engine, _, _ := newTestService(t, model.FIFO, false, 3)
+		request := mutationRequest{ctx: context.Background(), queueName: "jobs", result: make(chan mutationResult, 1), mutation: func() error {
+			message := &model.Message{ID: "large", Queue: "jobs", Payload: json.RawMessage(`"` + strings.Repeat("x", maxMutationBatchBytes) + `"`), Sequence: engine.state.NextSequence}
+			engine.state.NextSequence++
+			engine.state.Queues["jobs"].Messages[message.ID] = message
+			engine.totalMessages++
+			return nil
+		}}
+		engine.processMutationRequests([]mutationRequest{request})
+		if result := <-request.result; !IsCode(result.err, CodeCapacityExceeded) {
+			t.Fatalf("oversized result = %+v", result)
+		}
+	})
+}
+
 func TestRemainingEngineErrorAndStateBranches(t *testing.T) {
 	ctx := context.Background()
 	store := &memoryJournal{}
