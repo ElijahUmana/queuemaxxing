@@ -121,7 +121,7 @@ An accepted enqueue creates one message ID and one sequence. Its initial state i
 - `delayed` when `available_at > now`
 - `ready` when `available_at <= now`
 
-An explicit absolute `available_at` and relative delay cannot be interpreted inconsistently; the API contract defines validation and precedence rather than silently combining them.
+An enqueue request rejects simultaneous `delay_ms` and `available_at`. When `delay_ms` is omitted, the queue’s default delay still applies; an explicit `available_at` can only postpone that default eligibility time, not make the message eligible earlier.
 
 ### Promotion
 
@@ -183,7 +183,7 @@ This prevents the ABA failure in which:
 3. Worker B receives the same message.
 4. A’s late ack incorrectly deletes B’s active delivery.
 
-Step 4 fails because A’s receipt refers to an older epoch. Receipt values must not be exposed in list APIs, persisted in logs, or rendered as ordinary message metadata.
+Step 4 fails because A’s receipt refers to an older epoch. Receipt values are durably stored as lease state for restart recovery, but they must not appear in list APIs, application/HTTP logs, or ordinary message metadata.
 
 ## Idempotency
 
@@ -196,7 +196,7 @@ For each supported operation, durable idempotency state binds:
 - Canonical request fingerprint
 - Committed result or stable terminal outcome
 
-An identical retry returns the prior result without another mutation. Reusing a key with a different fingerprint returns `idempotency_conflict`. Idempotency entries must survive restart for their documented retention window.
+An identical retry returns the prior result without another mutation. Reusing a key with a different fingerprint returns `idempotency_conflict`. Idempotency entries survive restart and expire after the configured retention period, 24 hours by default. The default cap is 1,000,000 retained idempotency records.
 
 Idempotency does not provide exactly-once downstream processing. It suppresses duplicate queue mutations caused by request replay.
 
@@ -206,16 +206,19 @@ Each logical operation follows one transaction protocol:
 
 ```text
 request
-  -> validate against current state
-  -> build deterministic transaction/events
-  -> append framed WAL transaction
-  -> fsync WAL
-  -> apply transaction to memory
-  -> publish wakeups/result
+  -> bounded coordinator admission
+  -> validate and apply speculatively in serialized request order
+  -> encode one deterministic WAL record for each successful state change
+  -> append the bounded record group with Journal.AppendBatch
+  -> synchronize WAL and durable head once for the group
+  -> stamp authoritative LSNs
+  -> publish wakeups/results
   -> return success
 ```
 
-A successful response means the WAL transaction crossed the synchronization boundary. Cancellation before commit produces no acknowledged mutation. Cancellation after durable commit cannot roll the mutation back; an idempotent retry retrieves its result.
+The engine coordinator admits at most 256 queued mutation requests, collects at most 64 state-changing records or 8 MiB of encoded payload for one group, and waits at most 250 microseconds to collect neighbors. Invalid requests fail independently and their speculative state is restored without poisoning valid requests in the same group. A journal failure restores every successful speculative mutation in reverse order; no read can observe tentative state because the state lock remains held through the durability boundary. Receive reservations use the same coordinator. Close stops new admission, drains accepted requests, waits for their results, and then closes the journal.
+
+Cancellation before coordinator admission or inclusion produces no mutation. Once included in a durability group, cancellation cannot withdraw the record; the operation completes according to the committed result and idempotency semantics. A successful response means the WAL transaction crossed the synchronization boundary. An idempotent retry retrieves the durable result after response loss.
 
 The in-memory apply step must be deterministic and infallible for a previously validated transaction. If this invariant is violated, the process should fail rather than serve memory state that disagrees with the WAL.
 
@@ -262,17 +265,19 @@ A corrupt log must produce a diagnostic with the segment, offset, LSN when known
 
 ## Snapshots and compaction
 
-A snapshot is a checksummed serialization of the complete logical state through a durable LSN. Publication follows write-temporary, sync-file, atomic-rename, and sync-directory semantics where supported.
+A snapshot is a checksummed serialization of the complete logical state through a durable LSN. Publication writes a temporary file, synchronizes it, renames it within the rooted store, and synchronizes the containing directory.
 
 Compaction must preserve a recovery fallback until the new snapshot and manifest are durable. Old WAL segments become deletable only after publication. A crash at any phase must recover either the old complete chain or the new complete snapshot-plus-tail chain.
 
-Compaction can pause or increase write latency in this single-node implementation; its exact concurrency behavior must be measured and documented rather than hidden.
+Compaction serializes with queue mutations while it materializes retention changes, writes the snapshot, and checkpoints the journal. It can therefore pause or increase write latency; no compaction-latency bound is claimed.
 
 ## Filesystem ownership and locking
 
 Only one process may write a data directory. The lock must be held for the service lifetime and released on orderly close. Failure to acquire it is a startup error, not a cue to open concurrently.
 
-The design assumes a local filesystem with the atomic rename and synchronization behavior required by the concrete journal. Network filesystems and external mutation of data files are outside the supported durability boundary unless explicitly tested.
+The crash-durability contract assumes a local filesystem that honors the file synchronization, directory synchronization, rooted rename, and exclusive locking used by the journal. It is asserted on Linux, macOS, DragonFly BSD, FreeBSD, NetBSD, and OpenBSD. Windows uses rooted rename, calls `Sync` on opened files and containing directories, propagates synchronization failures, and holds an exclusive lock, but Go does not document Windows directory-handle `Sync` strongly enough to claim equivalent power-loss durability; no journal-specific write-through rename flag is used. Other platforms fail journal startup because exclusive locking is unsupported. Network filesystems and external mutation of data files are outside the supported durability boundary. On platforms with Unix permission bits, startup normalizes managed directories and regular files to owner-only `0700` and `0600` modes through rooted opened handles.
+
+`SegmentSize` is a rotation target, not a hard frame limit. A single atomic append request or one group-commit buffer may exceed it and remains in one segment and one synchronization boundary; the next append rotates first. This avoids empty segments and preserves request atomicity. Individual record and snapshot payloads remain bounded at 64 MiB. An atomic journal `AppendBatch` accepts at most 1,024 records and at most 64 MiB plus one record frame of total encoded bytes; over-limit requests are rejected before payload cloning or queue admission and cannot advance the durable LSN.
 
 ## Read-only fail-stop mode
 
@@ -282,24 +287,13 @@ The service does not swallow disk-full or permission errors, claim that unsynchr
 
 ## Resource bounds
 
-Every externally controlled dimension needs an explicit bound:
+Default engine limits are 1,000 queues, 1,000,000 messages service-wide, 100,000 messages per queue, 1 MiB payloads, 1,000,000 idempotency records, 256-byte idempotency keys, 30-second long polls, 12-hour visibility timeouts, and 30-day delays. The HTTP layer allows at most 50 list results, bounds JSON request bodies to 1 MiB plus 64 KiB of envelope overhead, applies a 35-second request deadline, and admits at most 256 concurrent non-health requests and 64 receives with a positive wait timeout. Health probes are exempt; zero-wait receives use only the general request permit. Admission overload fails immediately with HTTP 429, `capacity_exceeded`, and `Retry-After: 1`. WAL and snapshot payload framing is bounded at 64 MiB.
 
-- HTTP body and JSON depth/shape
-- Message payload size
-- Queue count and message count/bytes
-- Delay, visibility, and wait durations
-- Pagination limit and cursor size
-- Idempotency key and stored outcome retention
-- In-flight deliveries and long pollers
-- WAL frame and transaction sizes
-- Segment and snapshot sizes
-- Failure-reason and metadata lengths
-
-At a hard capacity limit, producers receive `capacity_exceeded`; the service must not evict acknowledgedly accepted work without an explicit retention contract.
+At a hard queue or message capacity limit, producers receive `capacity_exceeded`; accepted work is not evicted to admit new work. Acknowledged messages and dead letters count toward the configured message limits until compaction prunes eligible retained state. Operators must therefore monitor message and WAL growth and compact deliberately; the service does not claim automatic disk quotas, producer blocking, or eviction.
 
 ## HTTP trust boundary
 
-The network API is the system boundary. It must:
+The queue API and workbench are network boundaries. Neither has native authentication, authorization, or TLS, and both bind to loopback by default. Both require an IP-literal listen host and reject hostnames, including `localhost`, to avoid name-resolution and bind-scope drift. Each rejects non-loopback IPs unless the operator enables that binary’s `--allow-non-loopback` flag or environment opt-in; this changes exposure validation but supplies no security controls. Non-loopback deployment requires a trusted authenticated TLS reverse proxy and network policy. Within that exposure model, the API:
 
 - Bind to loopback by default
 - Require the expected content type for JSON bodies
@@ -310,11 +304,19 @@ The network API is the system boundary. It must:
 - Return stable machine-readable error codes without internal paths or receipt values
 - Treat cursor, receipt, and idempotency tokens as opaque
 
-Queue names and identifiers must be validated before they affect filesystem paths. User payloads are never interpolated into HTML or shell commands.
+Journal file operations are rooted beneath the operator-selected data directory. Managed subdirectories are rejected when they are symlinks, and discovered WAL and snapshot entries must be regular files. Queue names and identifiers do not become filesystem paths. User payloads are never interpolated into HTML or shell commands.
+
+The Compose deployment explicitly opts both services into non-loopback binds only inside its container network so the workbench can reach the queue and the host can publish each container port. Host publication remains `127.0.0.1` for both services. This topology does not turn the workbench into an authorization boundary or add transport security.
+
+The server enters draining mode before HTTP shutdown, rejects new non-health operations, permits accepted handlers to finish within the shutdown deadline, and closes the queue service only after HTTP draining completes. This ordering prevents service closure from invalidating already accepted requests.
+
+## Pagination contract
+
+Message and dead-letter pages are ordered by durable enqueue sequence. The cursor is an opaque versioned string transport; clients must not parse its representation or treat it as a number. The token binds the queue, normalized state filter, live/dead endpoint scope, durable snapshot LSN, snapshot generation, snapshot time, initial sequence high-water mark, and last returned sequence. A continuation resumes after that sequence only within the bound scope; cross-queue, cross-filter, and live/dead reuse is rejected. Messages enqueued or durably mutated after the initial page are excluded, and time-derived state membership is evaluated at the bound snapshot time. Retention deletion occurs only during explicit compaction; a pruning compaction advances the snapshot generation and makes older cursors unavailable rather than silently truncating their membership. Each page exposes the bound `snapshot_lsn` separately from `next_cursor`. The current token version and encoding are internal and may change without changing the opaque-string API contract.
 
 ## Observability
 
-Service statistics expose queue/message counts and storage state, including durable LSN, WAL bytes, segment/snapshot information where implemented, last sync time, and read-only status/reason.
+Service statistics expose queue/message counts and storage state, including durable LSN, WAL bytes, segment/snapshot information where implemented, last sync time, and read-only status. When read-only, public `read_only_reason` is the stable category `storage operation failed`; exact path-bearing causes remain internal.
 
 Readiness means the service can safely perform its configured role, including owning the data directory and having usable storage. Liveness only means the process and HTTP loop are responsive. A fail-stop storage error should therefore fail readiness without pretending the process is dead.
 
@@ -349,7 +351,7 @@ It does not address:
 - Exactly-once external side effects
 - Global completion ordering
 - Retained replay after acknowledgement
-- Authentication or transport encryption unless provided by the finalized server or an external proxy
+- Authentication or transport encryption; non-loopback deployments require an external authenticated TLS boundary
 
 These limits define where SQS, RabbitMQ, Pulsar, NATS JetStream, or an application-embedded library is the stronger choice.
 
@@ -366,8 +368,8 @@ Architecture claims become release claims only when repository tests reproduce t
 - Torn-tail repair and corruption refusal
 - Exclusive data-directory locking
 - Injected disk-full/write/sync/rename failures
-- Snapshot and compaction crash matrices
+- Snapshot publication, fallback recovery, and injected compaction failures
 - Strict HTTP parsing and bounded-resource tests
 - Real workbench browser flows through the public API
 
-The canonical commands are maintained in the root README and must match the actual scripts and test packages present in the repository.
+The canonical commands are maintained in the root README and match the repository’s current scripts and test packages. A configured workflow is a gate definition, not evidence of a successful run.
