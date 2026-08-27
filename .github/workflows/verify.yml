@@ -73,8 +73,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts/container
-          uid=$(docker compose exec -T queue /busybox/sh -c 'id -u')
-          test "$uid" != "0"
+          container_id=$(docker compose ps --quiet queue)
+          uid=$(docker inspect --format '{{.Config.User}}' "$container_id")
+          case "$uid" in
+            ''|*[!0-9]*|0) printf 'queue container has invalid nonroot UID %s\n' "$uid" >&2; exit 1 ;;
+          esac
           printf '%s\n' "$uid" > artifacts/container/queue-uid.txt
           curl --fail --silent http://127.0.0.1:8080/health/ready
           curl --fail --silent http://127.0.0.1:8081/healthz
