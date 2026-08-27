@@ -2,16 +2,22 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -25,8 +31,9 @@ const (
 )
 
 type config struct {
-	listenAddress string
-	apiURL        string
+	listenAddress    string
+	apiURL           string
+	allowNonLoopback bool
 }
 
 func main() {
@@ -38,6 +45,9 @@ func main() {
 }
 
 func run(parent context.Context, config config, logger *slog.Logger) error {
+	if err := validateListenAddress(config.listenAddress, config.allowNonLoopback); err != nil {
+		return err
+	}
 	handler, err := newHandler(config.apiURL, logger)
 	if err != nil {
 		return fmt.Errorf("configure workbench: %w", err)
@@ -75,8 +85,32 @@ func parseConfig() config {
 	var cfg config
 	flag.StringVar(&cfg.listenAddress, "listen", envOrDefault("QMAX_WORKBENCH_LISTEN", defaultListenAddress), "workbench listen address")
 	flag.StringVar(&cfg.apiURL, "api-url", envOrDefault("QMAX_API_URL", defaultAPIURL), "qmax public API base URL")
+	flag.BoolVar(&cfg.allowNonLoopback, "allow-non-loopback", envBool("QMAX_WORKBENCH_ALLOW_NON_LOOPBACK"), "allow listening beyond loopback when protected by external authentication and TLS")
 	flag.Parse()
 	return cfg
+}
+
+func validateListenAddress(address string, allowNonLoopback bool) error {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid listen address: %w", err)
+	}
+	if port == "" {
+		return errors.New("listen address must include a port")
+	}
+	parsed, err := netip.ParseAddr(host)
+	if err != nil {
+		return errors.New("listen address host must be an IP address")
+	}
+	if !parsed.IsLoopback() && !allowNonLoopback {
+		return errors.New("non-loopback listen address requires --allow-non-loopback and external authentication and TLS")
+	}
+	return nil
+}
+
+func envBool(name string) bool {
+	value, err := strconv.ParseBool(os.Getenv(name))
+	return err == nil && value
 }
 
 func envOrDefault(name, fallback string) string {
@@ -84,6 +118,39 @@ func envOrDefault(name, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+type proxyProblem struct {
+	Type      string `json:"type"`
+	Title     string `json:"title"`
+	Status    int    `json:"status"`
+	Code      string `json:"code"`
+	Detail    string `json:"detail"`
+	RequestID string `json:"request_id"`
+}
+
+func proxyRequestID(request *http.Request) string {
+	requestID := request.Header.Get("X-Request-ID")
+	if validRequestID(requestID) {
+		return requestID
+	}
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err == nil {
+		return "req_" + hex.EncodeToString(value[:])
+	}
+	return "req_" + strconv.FormatInt(time.Now().UnixNano(), 16)
+}
+
+func validRequestID(value string) bool {
+	if len(value) < 1 || len(value) > 128 {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x21 || character > 0x7e {
+			return false
+		}
+	}
+	return true
 }
 
 func newHandler(apiURL string, logger *slog.Logger) (http.Handler, error) {
@@ -112,10 +179,15 @@ func newHandler(apiURL string, logger *slog.Logger) (http.Handler, error) {
 		request.Header.Set("X-Qmax-Workbench", "1")
 	}
 	proxy.ErrorHandler = func(response http.ResponseWriter, request *http.Request, proxyErr error) {
-		logger.Warn("queue API unavailable", "method", request.Method, "path", request.URL.Path, "error", proxyErr)
+		requestID := proxyRequestID(request)
+		logger.Warn("queue API unavailable", "request_id", requestID, "method", request.Method, "route", "api_proxy", "error_type", fmt.Sprintf("%T", proxyErr))
 		response.Header().Set("Content-Type", "application/problem+json")
+		response.Header().Set("X-Request-ID", requestID)
 		response.WriteHeader(http.StatusBadGateway)
-		_, _ = response.Write([]byte(`{"type":"urn:queuemaxxing:problem:api_unavailable","title":"Queue API unavailable","status":502,"code":"api_unavailable","detail":"The queue API is unavailable.","request_id":""}`))
+		_ = json.NewEncoder(response).Encode(proxyProblem{
+			Type: "urn:queuemaxxing:problem:api_unavailable", Title: "Queue API unavailable",
+			Status: http.StatusBadGateway, Code: "api_unavailable", Detail: "The queue API is unavailable.", RequestID: requestID,
+		})
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/api/", proxy)
