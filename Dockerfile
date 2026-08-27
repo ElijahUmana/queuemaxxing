@@ -11,7 +11,7 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /out/qmax ./cmd/qmax &&
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /out/qmax /usr/local/bin/qmax
 COPY --from=build /out/qmax-workbench /usr/local/bin/qmax-workbench
-COPY --from=build --chown=65532:65532 /out/data /data
+COPY --from=build --chown=65532:65532 --chmod=0700 /out/data /data
 VOLUME ["/data"]
 EXPOSE 8080 8081
 ENTRYPOINT ["/usr/local/bin/qmax"]
