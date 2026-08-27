@@ -40,8 +40,32 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go install golang.org/x/tools/cmd/stress@latest
-      - run: go test -race -c -o artifacts/integration-race.test ./internal/integration
-      - run: stress -p 8 -timeout 30m artifacts/integration-race.test
+      - name: Compile race integration tests
+        run: mkdir -p artifacts && go test -race -c -o artifacts/integration-race.test ./internal/integration
+      - name: Run finite race stress
+        shell: bash
+        run: |
+          set -u
+          set +e
+          timeout --signal=TERM --kill-after=15s 30m \
+            stress -failfast -p 8 -timeout 5m -o artifacts/race-stress-failure- artifacts/integration-race.test \
+            2>&1 | tee artifacts/race-stress.log
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          stress_status=${pipeline_status[0]}
+          tee_status=${pipeline_status[1]}
+          if (( tee_status != 0 )); then
+            printf 'tee failed with status %d\n' "$tee_status" >&2
+            exit "$tee_status"
+          fi
+          if (( stress_status != 124 )); then
+            printf 'race stress exited before the 30-minute bound with status %d\n' "$stress_status" >&2
+            if (( stress_status == 0 )); then
+              exit 1
+            fi
+            exit "$stress_status"
+          fi
+          printf 'race stress completed the bounded 30-minute window\n'
       - name: Upload race evidence
         if: always()
         uses: actions/upload-artifact@v4
