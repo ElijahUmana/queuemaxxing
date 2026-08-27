@@ -31,20 +31,16 @@ paths:
         '413': {$ref: '#/components/responses/Problem'}
         '415': {$ref: '#/components/responses/Problem'}
         '422': {$ref: '#/components/responses/Problem'}
-        '429': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
     get:
       operationId: listQueues
       responses:
-        '200':
-          description: Queue collection
-          content:
-            application/json:
-              schema:
-                type: object
-                additionalProperties: false
-                required: [queues]
-                properties: {queues: {type: array, items: {$ref: '#/components/schemas/Queue'}}}
+        '200': {description: Queue collection, content: {application/json: {schema: {type: object, additionalProperties: false, required: [queues], properties: {queues: {type: array, items: {$ref: '#/components/schemas/Queue'}}}}}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
   /v1/queues/{queue}:
     parameters: [{$ref: '#/components/parameters/Queue'}]
     get:
@@ -52,6 +48,9 @@ paths:
       responses:
         '200': {description: Queue state, content: {application/json: {schema: {$ref: '#/components/schemas/Queue'}}}}
         '404': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
   /v1/queues/{queue}/messages:
     parameters: [{$ref: '#/components/parameters/Queue'}]
     post:
@@ -63,17 +62,26 @@ paths:
       responses:
         '201': {description: Message durably enqueued, content: {application/json: {schema: {$ref: '#/components/schemas/MessageMutation'}}}}
         '200': {description: Idempotent replay, content: {application/json: {schema: {$ref: '#/components/schemas/MessageMutation'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '415': {$ref: '#/components/responses/Problem'}
         '422': {$ref: '#/components/responses/Problem'}
-        '429': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
     get:
       operationId: listMessages
       parameters: [{$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Cursor'}, {$ref: '#/components/parameters/State'}]
       responses:
-        '200': {description: Weakly consistent keyset page, content: {application/json: {schema: {$ref: '#/components/schemas/MessagePage'}}}}
+        '200': {description: Snapshot-consistent keyset page bound to the opaque cursor scope, content: {application/json: {schema: {$ref: '#/components/schemas/MessagePage'}}}}
         '400': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
         '422': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
   /v1/queues/{queue}/messages:receive:
     parameters: [{$ref: '#/components/parameters/Queue'}, {$ref: '#/components/parameters/OptionalIdempotencyKey'}]
     post:
@@ -85,8 +93,15 @@ paths:
         '200':
           description: One reserved message or an empty messages array after long-poll timeout
           content: {application/json: {schema: {$ref: '#/components/schemas/ReceiveResponse'}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '415': {$ref: '#/components/responses/Problem'}
         '422': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
   /v1/queues/{queue}/messages/{message}/ack:
     parameters: [{$ref: '#/components/parameters/Queue'}, {$ref: '#/components/parameters/Message'}, {$ref: '#/components/parameters/OptionalIdempotencyKey'}]
     post:
@@ -94,7 +109,15 @@ paths:
       requestBody: {$ref: '#/components/requestBodies/Receipt'}
       responses:
         '200': {description: Message acknowledged, content: {application/json: {schema: {$ref: '#/components/schemas/AckResponse'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '415': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
   /v1/queues/{queue}/messages/{message}/nack:
     parameters: [{$ref: '#/components/parameters/Queue'}, {$ref: '#/components/parameters/Message'}, {$ref: '#/components/parameters/OptionalIdempotencyKey'}]
     post:
@@ -104,7 +127,15 @@ paths:
         content: {application/json: {schema: {$ref: '#/components/schemas/NackRequest'}}}
       responses:
         '200': {description: Message requeued or dead-lettered, content: {application/json: {schema: {$ref: '#/components/schemas/MessageMutation'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '415': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
   /v1/queues/{queue}/messages/{message}/extend:
     parameters: [{$ref: '#/components/parameters/Queue'}, {$ref: '#/components/parameters/Message'}, {$ref: '#/components/parameters/OptionalIdempotencyKey'}]
     post:
@@ -114,7 +145,15 @@ paths:
         content: {application/json: {schema: {$ref: '#/components/schemas/ExtendRequest'}}}
       responses:
         '200': {description: Lease deadline replaced, content: {application/json: {schema: {$ref: '#/components/schemas/DeliveryMutation'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '415': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
   /v1/queues/{queue}/dead-letters:
     parameters: [{$ref: '#/components/parameters/Queue'}]
     get:
@@ -122,6 +161,12 @@ paths:
       parameters: [{$ref: '#/components/parameters/Limit'}, {$ref: '#/components/parameters/Cursor'}]
       responses:
         '200': {description: Dead-letter page, content: {application/json: {schema: {$ref: '#/components/schemas/MessagePage'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
   /v1/queues/{queue}/dead-letters/{message}/redrive:
     parameters: [{$ref: '#/components/parameters/Queue'}, {$ref: '#/components/parameters/Message'}, {$ref: '#/components/parameters/RequiredIdempotencyKey'}]
     post:
@@ -132,12 +177,23 @@ paths:
       responses:
         '201': {description: Child message durably created, content: {application/json: {schema: {$ref: '#/components/schemas/RedriveMutation'}}}}
         '200': {description: Idempotent replay, content: {application/json: {schema: {$ref: '#/components/schemas/RedriveMutation'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '404': {$ref: '#/components/responses/Problem'}
         '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '415': {$ref: '#/components/responses/Problem'}
+        '422': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
   /v1/stats:
     get:
       operationId: stats
       responses:
         '200': {description: Service and storage statistics, content: {application/json: {schema: {$ref: '#/components/schemas/ServiceStats'}}}}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
   /v1/admin/compact:
     post:
       operationId: compact
@@ -146,7 +202,13 @@ paths:
         content: {application/json: {schema: {type: object, additionalProperties: false}}}
       responses:
         '200': {description: Compaction completed, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}
+        '400': {$ref: '#/components/responses/Problem'}
+        '409': {$ref: '#/components/responses/Problem'}
+        '413': {$ref: '#/components/responses/Problem'}
+        '415': {$ref: '#/components/responses/Problem'}
+        '429': {$ref: '#/components/responses/RateLimited'}
         '503': {$ref: '#/components/responses/Problem'}
+        '504': {$ref: '#/components/responses/Problem'}
 components:
   parameters:
     Queue: {name: queue, in: path, required: true, schema: {type: string, minLength: 1, maxLength: 128}}
@@ -169,12 +231,22 @@ components:
       headers:
         X-Request-ID: {schema: {type: string}}
       content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}
+    RateLimited:
+      description: Request or long-poll capacity is exhausted
+      headers:
+        X-Request-ID: {schema: {type: string}}
+        Retry-After: {schema: {type: integer, minimum: 1}, description: Seconds before retrying}
+      content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}
   schemas:
     Ordering: {type: string, enum: [fifo, lifo]}
     MessageState: {type: string, enum: [delayed, ready, leased, acked, dead]}
     Timestamp: {type: string, format: date-time}
     Uint64String: {type: string, pattern: '^[0-9]+$'}
-    Milliseconds: {type: integer, format: int64, minimum: 0, maximum: 9223372036854}
+    DelayMilliseconds: {type: integer, format: int64, minimum: 0, maximum: 2592000000}
+    VisibilityMilliseconds: {type: integer, format: int64, minimum: 1, maximum: 43200000}
+    WaitMilliseconds: {type: integer, format: int64, minimum: 0, maximum: 30000}
+    Uint32: {type: integer, format: int64, minimum: 0, maximum: 4294967295}
+    PositiveUint32: {type: integer, format: int64, minimum: 1, maximum: 4294967295}
     Counts:
       type: object
       additionalProperties: false
@@ -189,23 +261,23 @@ components:
     CreateQueueRequest:
       type: object
       additionalProperties: false
-      required: [name, ordering, priority_enabled, default_delay_ms, default_visibility_timeout_ms, max_deliveries]
+      required: [name, ordering, default_visibility_timeout_ms, max_deliveries]
       properties:
         name: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9._-]+$'}
         ordering: {$ref: '#/components/schemas/Ordering'}
-        priority_enabled: {type: boolean}
-        default_delay_ms: {$ref: '#/components/schemas/Milliseconds'}
-        default_visibility_timeout_ms: {allOf: [{$ref: '#/components/schemas/Milliseconds'}, {minimum: 1}]}
-        max_deliveries: {type: integer, format: int32, minimum: 1}
+        priority_enabled: {type: boolean, default: false}
+        default_delay_ms: {allOf: [{$ref: '#/components/schemas/DelayMilliseconds'}], default: 0, description: Defaults to zero; when omitted, available_at can only postpone the queue default eligibility time}
+        default_visibility_timeout_ms: {$ref: '#/components/schemas/VisibilityMilliseconds'}
+        max_deliveries: {$ref: '#/components/schemas/PositiveUint32'}
     QueueConfig:
       required: [name, ordering, priority_enabled, default_delay_ms, default_visibility_timeout_ms, max_deliveries, created_at]
       properties:
         name: {type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9._-]+$'}
         ordering: {$ref: '#/components/schemas/Ordering'}
         priority_enabled: {type: boolean}
-        default_delay_ms: {$ref: '#/components/schemas/Milliseconds'}
-        default_visibility_timeout_ms: {allOf: [{$ref: '#/components/schemas/Milliseconds'}, {minimum: 1}]}
-        max_deliveries: {type: integer, format: int32, minimum: 1}
+        default_delay_ms: {$ref: '#/components/schemas/DelayMilliseconds'}
+        default_visibility_timeout_ms: {$ref: '#/components/schemas/VisibilityMilliseconds'}
+        max_deliveries: {$ref: '#/components/schemas/PositiveUint32'}
         created_at: {$ref: '#/components/schemas/Timestamp'}
     Queue:
       type: object
@@ -220,14 +292,14 @@ components:
       properties:
         payload: {}
         priority: {type: integer, format: int32}
-        delay_ms: {$ref: '#/components/schemas/Milliseconds'}
-        available_at: {$ref: '#/components/schemas/Timestamp'}
+        delay_ms: {$ref: '#/components/schemas/DelayMilliseconds'}
+        available_at: {allOf: [{$ref: '#/components/schemas/Timestamp'}], description: Absolute lower bound on eligibility; cannot shorten the queue default delay and must be within 30 days of server time}
     ReceiveRequest:
       type: object
       additionalProperties: false
       properties:
-        visibility_timeout_ms: {allOf: [{$ref: '#/components/schemas/Milliseconds'}, {minimum: 1}]}
-        wait_timeout_ms: {$ref: '#/components/schemas/Milliseconds'}
+        visibility_timeout_ms: {$ref: '#/components/schemas/VisibilityMilliseconds'}
+        wait_timeout_ms: {$ref: '#/components/schemas/WaitMilliseconds'}
     ReceiptRequest:
       type: object
       additionalProperties: false
@@ -236,30 +308,30 @@ components:
     NackRequest:
       type: object
       additionalProperties: false
-      required: [receipt_handle, retry_delay_ms]
+      required: [receipt_handle]
       properties:
         receipt_handle: {type: string, minLength: 1, writeOnly: true}
-        retry_delay_ms: {$ref: '#/components/schemas/Milliseconds'}
-        reason: {type: string, maxLength: 512}
+        retry_delay_ms: {allOf: [{$ref: '#/components/schemas/DelayMilliseconds'}], default: 0}
+        reason: {type: string, description: At most 512 UTF-8 bytes}
     ExtendRequest:
       type: object
       additionalProperties: false
       required: [receipt_handle, visibility_timeout_ms]
       properties:
         receipt_handle: {type: string, minLength: 1, writeOnly: true}
-        visibility_timeout_ms: {allOf: [{$ref: '#/components/schemas/Milliseconds'}, {minimum: 1}]}
+        visibility_timeout_ms: {$ref: '#/components/schemas/VisibilityMilliseconds'}
     RedriveRequest:
       type: object
       additionalProperties: false
       not: {required: [delay_ms, available_at]}
       properties:
         priority: {type: integer, format: int32}
-        delay_ms: {$ref: '#/components/schemas/Milliseconds'}
-        available_at: {$ref: '#/components/schemas/Timestamp'}
+        delay_ms: {$ref: '#/components/schemas/DelayMilliseconds'}
+        available_at: {allOf: [{$ref: '#/components/schemas/Timestamp'}], description: Absolute lower bound on eligibility within 30 days of server time}
     Message:
       type: object
       additionalProperties: false
-      required: [id, queue, payload, priority, sequence, enqueued_at, available_at, state, delivery_count, last_lsn]
+      required: [id, queue, payload, priority, sequence, enqueued_at, available_at, state, delivery_count]
       properties:
         id: {type: string}
         queue: {type: string}
@@ -269,13 +341,12 @@ components:
         enqueued_at: {$ref: '#/components/schemas/Timestamp'}
         available_at: {$ref: '#/components/schemas/Timestamp'}
         state: {$ref: '#/components/schemas/MessageState'}
-        delivery_count: {type: integer, format: int32, minimum: 0}
+        delivery_count: {$ref: '#/components/schemas/Uint32'}
         leased_at: {$ref: '#/components/schemas/Timestamp'}
         lease_expires_at: {$ref: '#/components/schemas/Timestamp'}
         last_failure_reason: {type: string}
         dead_at: {$ref: '#/components/schemas/Timestamp'}
         replay_of: {type: string}
-        last_lsn: {$ref: '#/components/schemas/Uint64String'}
     Delivery:
       type: object
       additionalProperties: false
@@ -284,7 +355,7 @@ components:
         message: {$ref: '#/components/schemas/Message'}
         receipt_handle: {type: string, readOnly: true}
         lease_expires_at: {$ref: '#/components/schemas/Timestamp'}
-        delivery_count: {type: integer, format: int32, minimum: 1}
+        delivery_count: {$ref: '#/components/schemas/PositiveUint32'}
     QueueMutation: {$ref: '#/components/schemas/GenericQueueMutation'}
     GenericQueueMutation:
       type: object
