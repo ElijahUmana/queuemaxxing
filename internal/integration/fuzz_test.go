@@ -77,12 +77,12 @@ func FuzzEngineMatchesReference(f *testing.F) {
 				t.Fatalf("reference step %d: %v", step, err)
 			}
 		}
-		page, err := service.ListMessages(context.Background(), "fuzz", model.ListFilter{Limit: maxOperations})
+		stats, err := service.Stats(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(page.Messages) != nextID {
-			t.Fatalf("listed %d messages, enqueued %d", len(page.Messages), nextID)
+		if stats.Messages.Total != uint64(nextID) {
+			t.Fatalf("stats report %d messages, enqueued %d", stats.Messages.Total, nextID)
 		}
 	})
 }
