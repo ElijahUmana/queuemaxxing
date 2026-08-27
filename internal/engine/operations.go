@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -31,7 +32,37 @@ type extendMutationResult struct {
 }
 
 type redriveMutationResult struct {
-	Result model.RedriveResult `json:"result"`
+	Result        model.RedriveResult `json:"result"`
+	SourceChanged bool                `json:"source_changed,omitempty"`
+}
+
+func freezeEnqueueRequest(request model.EnqueueRequest) model.EnqueueRequest {
+	request.Payload = append(json.RawMessage(nil), request.Payload...)
+	if request.Priority != nil {
+		priority := *request.Priority
+		request.Priority = &priority
+	}
+	if request.Delay != nil {
+		delay := *request.Delay
+		request.Delay = &delay
+	}
+	if request.AvailableAt != nil {
+		availableAt := *request.AvailableAt
+		request.AvailableAt = &availableAt
+	}
+	return request
+}
+
+func freezeRedriveRequest(request model.RedriveRequest) model.RedriveRequest {
+	if request.Priority != nil {
+		priority := *request.Priority
+		request.Priority = &priority
+	}
+	if request.AvailableAt != nil {
+		availableAt := *request.AvailableAt
+		request.AvailableAt = &availableAt
+	}
+	return request
 }
 
 func (s *service) CreateQueue(ctx context.Context, config model.QueueConfig, idempotencyKey string) (model.QueueInfo, bool, error) {
@@ -57,7 +88,10 @@ func (s *service) CreateQueue(ctx context.Context, config model.QueueConfig, ide
 
 	var result queueMutationResult
 	replayed := false
-	err = s.mutate(ctx, config.Name, operationCreateQueue, idempotencyKey, func() error {
+	_, err = s.mutate(ctx, config.Name, operationCreateQueue, idempotencyKey, func() {
+		result = queueMutationResult{}
+		replayed = false
+	}, func() error {
 		if found, loadErr := s.loadIdempotencyLocked(operationCreateQueue, config.Name, idempotencyKey, requestFingerprint, &result); found || loadErr != nil {
 			replayed = found
 			return loadErr
@@ -115,6 +149,7 @@ func (s *service) GetQueue(ctx context.Context, name string) (model.QueueInfo, e
 }
 
 func (s *service) Enqueue(ctx context.Context, queueName string, request model.EnqueueRequest) (model.Message, bool, error) {
+	request = freezeEnqueueRequest(request)
 	if !json.Valid(request.Payload) {
 		return model.Message{}, false, invalid("payload must be valid JSON")
 	}
@@ -130,7 +165,10 @@ func (s *service) Enqueue(ctx context.Context, queueName string, request model.E
 	}
 	var result enqueueMutationResult
 	replayed := false
-	err = s.mutate(ctx, queueName, operationEnqueue, request.IdempotencyKey, func() error {
+	lsn, err := s.mutate(ctx, queueName, operationEnqueue, request.IdempotencyKey, func() {
+		result = enqueueMutationResult{}
+		replayed = false
+	}, func() error {
 		if found, loadErr := s.loadIdempotencyLocked(operationEnqueue, queueName, request.IdempotencyKey, requestFingerprint, &result); found || loadErr != nil {
 			replayed = found
 			return loadErr
@@ -145,6 +183,9 @@ func (s *service) Enqueue(ctx context.Context, queueName string, request model.E
 		if queueMessageCount(queue) >= s.limits.MaxMessagesPerQueue || s.totalMessageCountLocked() >= s.limits.MaxMessages {
 			return capacity("message capacity exceeded")
 		}
+		if s.state.NextSequence == math.MaxUint64 {
+			return capacity("message sequence capacity exceeded")
+		}
 		now := s.clock.Now()
 		delay := queue.Config.DefaultDelay
 		if request.Delay != nil {
@@ -154,7 +195,10 @@ func (s *service) Enqueue(ctx context.Context, queueName string, request model.E
 		if request.Priority != nil {
 			priority = *request.Priority
 		}
-		visibilityTime := availableAt(now, delay, request.AvailableAt)
+		visibilityTime, scheduleErr := boundedAvailableAt(now, delay, s.limits.MaxDelay, request.AvailableAt)
+		if scheduleErr != nil {
+			return scheduleErr
+		}
 		messageID, idErr := newID()
 		if idErr != nil {
 			return &Error{Code: CodeStorageUnavailable, Message: "generate message id", Cause: idErr}
@@ -170,10 +214,10 @@ func (s *service) Enqueue(ctx context.Context, queueName string, request model.E
 		s.state.NextSequence++
 		queue.Messages[messageID] = message
 		s.totalMessages++
-		message.LastLSN = s.nextLSNLocked()
 		result.Message = cloneMessage(message)
 		return s.saveIdempotencyLocked(operationEnqueue, queueName, request.IdempotencyKey, requestFingerprint, result)
 	})
+	stampMutationResult(&result, lsn)
 	return result.Message, replayed, err
 }
 
@@ -188,7 +232,16 @@ func (s *service) Receive(ctx context.Context, queueName string, request model.R
 	if err != nil {
 		return nil, false, err
 	}
-	deadline := s.clock.Now().Add(request.WaitTimeout)
+	deadline, err := checkedAdd(s.clock.Now(), request.WaitTimeout)
+	if err != nil {
+		return nil, false, err
+	}
+	registeredWaiter := false
+	defer func() {
+		if registeredWaiter {
+			s.releaseWaiter(queueName)
+		}
+	}()
 	for {
 		delivery, replayed, wake, nextEvent, receiveErr := s.receiveOnce(ctx, queueName, request, requestFingerprint)
 		if receiveErr != nil || delivery != nil || replayed {
@@ -196,6 +249,12 @@ func (s *service) Receive(ctx context.Context, queueName string, request model.R
 		}
 		if request.WaitTimeout == 0 {
 			return s.finishEmptyReceive(ctx, queueName, request, requestFingerprint)
+		}
+		if !registeredWaiter {
+			if err := s.registerWaiter(queueName); err != nil {
+				return nil, false, err
+			}
+			registeredWaiter = true
 		}
 		now := s.clock.Now()
 		if !now.Before(deadline) {
@@ -220,13 +279,42 @@ func (s *service) Receive(ctx context.Context, queueName string, request model.R
 	}
 }
 
+func (s *service) registerWaiter(queueName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.checkOpenLocked(); err != nil {
+		return err
+	}
+	if _, exists := s.state.Queues[queueName]; !exists {
+		return notFound("queue not found")
+	}
+	if s.totalWaiters >= s.limits.MaxWaiters || s.waitersByQueue[queueName] >= s.limits.MaxWaitersPerQueue {
+		return capacity("long-poll waiter capacity exceeded")
+	}
+	s.totalWaiters++
+	s.waitersByQueue[queueName]++
+	return nil
+}
+
+func (s *service) releaseWaiter(queueName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.waitersByQueue[queueName] > 0 {
+		s.waitersByQueue[queueName]--
+		s.totalWaiters--
+	}
+}
+
 func (s *service) finishEmptyReceive(ctx context.Context, queueName string, request model.ReceiveRequest, requestFingerprint string) (*model.Delivery, bool, error) {
 	if request.IdempotencyKey == "" {
 		return nil, false, nil
 	}
 	result := receiveMutationResult{}
 	replayed := false
-	err := s.mutate(ctx, queueName, operationReceive, request.IdempotencyKey, func() error {
+	lsn, err := s.mutate(ctx, queueName, operationReceive, request.IdempotencyKey, func() {
+		result = receiveMutationResult{}
+		replayed = false
+	}, func() error {
 		if found, loadErr := s.loadIdempotencyLocked(operationReceive, queueName, request.IdempotencyKey, requestFingerprint, &result); found || loadErr != nil {
 			replayed = found
 			return loadErr
@@ -236,70 +324,95 @@ func (s *service) finishEmptyReceive(ctx context.Context, queueName string, requ
 		}
 		return s.saveIdempotencyLocked(operationReceive, queueName, request.IdempotencyKey, requestFingerprint, result)
 	})
+	stampMutationResult(&result, lsn)
 	return result.Delivery, replayed, err
+}
+
+func activeInFlight(queue *queueState, now time.Time) int {
+	count := 0
+	for _, message := range queue.Messages {
+		if message.State == model.StateLeased && message.LeaseUntil != nil && now.Before(*message.LeaseUntil) {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *service) activeInFlightLocked(now time.Time) int {
+	count := 0
+	for _, queue := range s.state.Queues {
+		count += activeInFlight(queue, now)
+	}
+	return count
 }
 
 func (s *service) receiveOnce(ctx context.Context, queueName string, request model.ReceiveRequest, requestFingerprint string) (*model.Delivery, bool, <-chan struct{}, time.Time, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, false, nil, time.Time{}, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.checkOpenLocked(); err != nil {
-		return nil, false, nil, time.Time{}, err
+	var result receiveMutationResult
+	replayed := false
+	var emptyWake <-chan struct{}
+	var emptyNextEvent time.Time
+	lsn, err := s.mutate(ctx, queueName, operationReceive, request.IdempotencyKey, func() {
+		result = receiveMutationResult{}
+		replayed = false
+		emptyWake = nil
+		emptyNextEvent = time.Time{}
+	}, func() error {
+		if found, loadErr := s.loadIdempotencyLocked(operationReceive, queueName, request.IdempotencyKey, requestFingerprint, &result); found || loadErr != nil {
+			replayed = found
+			return loadErr
+		}
+		queue, exists := s.state.Queues[queueName]
+		if !exists {
+			return notFound("queue not found")
+		}
+		now := s.clock.Now()
+		candidate := selectCandidate(queue, now)
+		if candidate == nil {
+			emptyWake = s.wake
+			emptyNextEvent = nextQueueEvent(queue, now)
+			return nil
+		}
+		if candidate.State == model.StateLeased {
+			delete(queue.Receipts, candidate.ID)
+			clearLease(candidate)
+			candidate.LastFailureReason = "visibility_timeout"
+			s.totalInFlight--
+			s.inFlightByQueue[queueName]--
+		}
+		if activeInFlight(queue, now) >= s.limits.MaxInFlightPerQueue || s.activeInFlightLocked(now) >= s.limits.MaxInFlight {
+			return capacity("in-flight delivery capacity exceeded")
+		}
+		visibilityTimeout := request.VisibilityTimeout
+		if visibilityTimeout == 0 {
+			visibilityTimeout = queue.Config.DefaultVisibilityTimeout
+		}
+		candidate.State = model.StateLeased
+		candidate.DeliveryCount++
+		candidate.LeaseEpoch++
+		candidate.LeasedAt = timePointer(now)
+		leaseUntil, scheduleErr := checkedAdd(now, visibilityTimeout)
+		if scheduleErr != nil {
+			return scheduleErr
+		}
+		candidate.LeaseUntil = timePointer(leaseUntil)
+		receipt, receiptErr := newReceipt(candidate.ID, candidate.LeaseEpoch)
+		if receiptErr != nil {
+			return &Error{Code: CodeStorageUnavailable, Message: "generate receipt", Cause: receiptErr}
+		}
+		queue.Receipts[candidate.ID] = receipt
+		s.totalInFlight++
+		s.inFlightByQueue[queueName]++
+		result.Delivery = &model.Delivery{Message: cloneMessage(candidate), Receipt: receipt, LeaseUntil: leaseUntil, DeliveryCount: candidate.DeliveryCount}
+		return s.saveIdempotencyLocked(operationReceive, queueName, request.IdempotencyKey, requestFingerprint, result)
+	})
+	stampMutationResult(&result, lsn)
+	if err != nil || result.Delivery != nil || replayed {
+		return result.Delivery, replayed, nil, time.Time{}, err
 	}
-	var saved receiveMutationResult
-	if found, err := s.loadIdempotencyLocked(operationReceive, queueName, request.IdempotencyKey, requestFingerprint, &saved); found || err != nil {
-		return saved.Delivery, found, s.wake, time.Time{}, err
-	}
-	queue, exists := s.state.Queues[queueName]
-	if !exists {
-		return nil, false, nil, time.Time{}, notFound("queue not found")
-	}
-	now := s.clock.Now()
-	candidate := selectCandidate(queue, now)
-	if candidate == nil {
-		return nil, false, s.wake, nextQueueEvent(queue, now), nil
-	}
-	backup, err := s.backupMutationLocked(queueName, operationReceive, request.IdempotencyKey)
-	if err != nil {
-		return nil, false, nil, time.Time{}, &Error{Code: CodeStorageUnavailable, Message: "snapshot reservation", Cause: err}
-	}
-	if candidate.State == model.StateLeased {
-		delete(queue.Receipts, candidate.ID)
-		clearLease(candidate)
-		candidate.LastFailureReason = "visibility_timeout"
-	}
-	candidate.State = model.StateReady
-	visibilityTimeout := request.VisibilityTimeout
-	if visibilityTimeout == 0 {
-		visibilityTimeout = queue.Config.DefaultVisibilityTimeout
-	}
-	candidate.State = model.StateLeased
-	candidate.DeliveryCount++
-	candidate.LeaseEpoch++
-	candidate.LeasedAt = timePointer(now)
-	leaseUntil := now.Add(visibilityTimeout)
-	candidate.LeaseUntil = timePointer(leaseUntil)
-	receipt, receiptErr := newReceipt(candidate.ID, candidate.LeaseEpoch)
-	if receiptErr != nil {
-		s.restoreMutationLocked(backup)
-		return nil, false, nil, time.Time{}, &Error{Code: CodeStorageUnavailable, Message: "generate receipt", Cause: receiptErr}
-	}
-	queue.Receipts[candidate.ID] = receipt
-	candidate.LastLSN = s.nextLSNLocked()
-	delivery := &model.Delivery{Message: cloneMessage(candidate), Receipt: receipt, LeaseUntil: leaseUntil, DeliveryCount: candidate.DeliveryCount}
-	result := receiveMutationResult{Delivery: delivery}
-	if err := s.saveIdempotencyLocked(operationReceive, queueName, request.IdempotencyKey, requestFingerprint, result); err != nil {
-		s.restoreMutationLocked(backup)
-		return nil, false, nil, time.Time{}, err
-	}
-	if _, err := s.persistDeltaLocked(ctx, s.mutationDeltaLocked(backup)); err != nil {
-		s.restoreMutationLocked(backup)
-		return nil, false, nil, time.Time{}, &Error{Code: CodeStorageUnavailable, Message: "persist reservation", Cause: err}
-	}
-	s.notifyLocked()
-	return delivery, false, s.wake, time.Time{}, nil
+	return nil, false, emptyWake, emptyNextEvent, nil
 }
 
 func (s *service) Ack(ctx context.Context, queueName string, request model.AckRequest) (bool, error) {
@@ -311,7 +424,9 @@ func (s *service) Ack(ctx context.Context, queueName string, request model.AckRe
 		return false, err
 	}
 	replayed := false
-	err = s.mutate(ctx, queueName, operationAck, request.IdempotencyKey, func() error {
+	_, err = s.mutate(ctx, queueName, operationAck, request.IdempotencyKey, func() {
+		replayed = false
+	}, func() error {
 		var previous struct {
 			Acked bool `json:"acked"`
 		}
@@ -331,6 +446,8 @@ func (s *service) Ack(ctx context.Context, queueName string, request model.AckRe
 		}
 		now := s.clock.Now()
 		delete(queue.Receipts, message.ID)
+		s.totalInFlight--
+		s.inFlightByQueue[queueName]--
 		message.State = model.StateAcked
 		message.LeasedAt = nil
 		message.LeaseUntil = nil
@@ -356,7 +473,10 @@ func (s *service) Nack(ctx context.Context, queueName string, request model.Nack
 	}
 	var result nackMutationResult
 	replayed := false
-	err = s.mutate(ctx, queueName, operationNack, request.IdempotencyKey, func() error {
+	lsn, err := s.mutate(ctx, queueName, operationNack, request.IdempotencyKey, func() {
+		result = nackMutationResult{}
+		replayed = false
+	}, func() error {
 		if found, loadErr := s.loadIdempotencyLocked(operationNack, queueName, request.IdempotencyKey, requestFingerprint, &result); found || loadErr != nil {
 			replayed = found
 			return loadErr
@@ -367,22 +487,27 @@ func (s *service) Nack(ctx context.Context, queueName string, request model.Nack
 		}
 		now := s.clock.Now()
 		delete(queue.Receipts, message.ID)
+		s.totalInFlight--
+		s.inFlightByQueue[queueName]--
 		clearLease(message)
 		message.LastFailureReason = normalizeReason(request.Reason)
 		if message.DeliveryCount >= queue.Config.MaxDeliveries {
 			message.State = model.StateDead
 			message.DeadAt = timePointer(now)
 		} else {
-			message.AvailableAt = now.Add(request.Delay)
+			message.AvailableAt, leaseErr = checkedAdd(now, request.Delay)
+			if leaseErr != nil {
+				return leaseErr
+			}
 			message.State = model.StateReady
 			if request.Delay > 0 {
 				message.State = model.StateDelayed
 			}
 		}
-		message.LastLSN = s.nextLSNLocked()
 		result.Message = cloneMessage(message)
 		return s.saveIdempotencyLocked(operationNack, queueName, request.IdempotencyKey, requestFingerprint, result)
 	})
+	stampMutationResult(&result, lsn)
 	return result.Message, replayed, err
 }
 
@@ -399,7 +524,10 @@ func (s *service) Extend(ctx context.Context, queueName string, request model.Ex
 	}
 	var result extendMutationResult
 	replayed := false
-	err = s.mutate(ctx, queueName, operationExtend, request.IdempotencyKey, func() error {
+	lsn, err := s.mutate(ctx, queueName, operationExtend, request.IdempotencyKey, func() {
+		result = extendMutationResult{}
+		replayed = false
+	}, func() error {
 		if found, loadErr := s.loadIdempotencyLocked(operationExtend, queueName, request.IdempotencyKey, requestFingerprint, &result); found || loadErr != nil {
 			replayed = found
 			return loadErr
@@ -408,16 +536,20 @@ func (s *service) Extend(ctx context.Context, queueName string, request model.Ex
 		if leaseErr != nil {
 			return leaseErr
 		}
-		leaseUntil := s.clock.Now().Add(request.VisibilityTimeout)
+		leaseUntil, scheduleErr := checkedAdd(s.clock.Now(), request.VisibilityTimeout)
+		if scheduleErr != nil {
+			return scheduleErr
+		}
 		message.LeaseUntil = timePointer(leaseUntil)
-		message.LastLSN = s.nextLSNLocked()
 		result.Delivery = model.Delivery{Message: cloneMessage(message), Receipt: request.Receipt, LeaseUntil: leaseUntil, DeliveryCount: message.DeliveryCount}
 		return s.saveIdempotencyLocked(operationExtend, queueName, request.IdempotencyKey, requestFingerprint, result)
 	})
+	stampMutationResult(&result, lsn)
 	return result.Delivery, replayed, err
 }
 
 func (s *service) Redrive(ctx context.Context, queueName string, request model.RedriveRequest) (model.RedriveResult, bool, error) {
+	request = freezeRedriveRequest(request)
 	if request.MessageID == "" {
 		return model.RedriveResult{}, false, invalid("message id is required")
 	}
@@ -430,7 +562,10 @@ func (s *service) Redrive(ctx context.Context, queueName string, request model.R
 	}
 	var result redriveMutationResult
 	replayed := false
-	err = s.mutate(ctx, queueName, operationRedrive, request.IdempotencyKey, func() error {
+	lsn, err := s.mutate(ctx, queueName, operationRedrive, request.IdempotencyKey, func() {
+		result = redriveMutationResult{}
+		replayed = false
+	}, func() error {
 		if found, loadErr := s.loadIdempotencyLocked(operationRedrive, queueName, request.IdempotencyKey, requestFingerprint, &result); found || loadErr != nil {
 			replayed = found
 			return loadErr
@@ -443,13 +578,20 @@ func (s *service) Redrive(ctx context.Context, queueName string, request model.R
 		if !exists {
 			return notFound("message not found")
 		}
+		if !queue.Config.PriorityEnabled && request.Priority != nil {
+			return invalid("priority is disabled for this queue")
+		}
 		now := s.clock.Now()
+		sourceState := source.State
 		s.materializeLocked(queue, now)
 		if source.State != model.StateDead {
 			return conflict("only dead letters can be redriven")
 		}
 		if queueMessageCount(queue) >= s.limits.MaxMessagesPerQueue || s.totalMessageCountLocked() >= s.limits.MaxMessages {
 			return capacity("message capacity exceeded")
+		}
+		if s.state.NextSequence == math.MaxUint64 {
+			return capacity("message sequence capacity exceeded")
 		}
 		childID, idErr := newID()
 		if idErr != nil {
@@ -459,7 +601,10 @@ func (s *service) Redrive(ctx context.Context, queueName string, request model.R
 		if request.Priority != nil {
 			priority = *request.Priority
 		}
-		visibilityTime := availableAt(now, request.Delay, request.AvailableAt)
+		visibilityTime, scheduleErr := boundedAvailableAt(now, request.Delay, s.limits.MaxDelay, request.AvailableAt)
+		if scheduleErr != nil {
+			return scheduleErr
+		}
 		state := model.StateReady
 		if visibilityTime.After(now) {
 			state = model.StateDelayed
@@ -471,11 +616,11 @@ func (s *service) Redrive(ctx context.Context, queueName string, request model.R
 		s.state.NextSequence++
 		queue.Messages[child.ID] = child
 		s.totalMessages++
-		source.LastLSN = s.nextLSNLocked()
-		child.LastLSN = source.LastLSN
 		result.Result = model.RedriveResult{Source: cloneMessage(source), Child: cloneMessage(child)}
+		result.SourceChanged = source.State != sourceState
 		return s.saveIdempotencyLocked(operationRedrive, queueName, request.IdempotencyKey, requestFingerprint, result)
 	})
+	stampMutationResult(&result, lsn)
 	return result.Result, replayed, err
 }
 
@@ -507,6 +652,8 @@ func (s *service) materializeLocked(queue *queueState, now time.Time) bool {
 			if message.LeaseUntil != nil && !now.Before(*message.LeaseUntil) {
 				delete(queue.Receipts, id)
 				clearLease(message)
+				s.totalInFlight--
+				s.inFlightByQueue[queue.Config.Name]--
 				message.LastFailureReason = "visibility_timeout"
 				if message.DeliveryCount >= queue.Config.MaxDeliveries {
 					message.State = model.StateDead
@@ -517,10 +664,19 @@ func (s *service) materializeLocked(queue *queueState, now time.Time) bool {
 				}
 				changed = true
 			}
-		case model.StateAcked:
+		}
+	}
+	return changed
+}
+
+func (s *service) pruneRetentionLocked(queue *queueState, now time.Time) bool {
+	changed := false
+	for id, message := range queue.Messages {
+		if message.State == model.StateAcked {
 			if ackedAt, exists := queue.AckedAt[id]; exists && !ackedAt.Add(s.limits.AckTombstoneRetention).After(now) {
 				delete(queue.Messages, id)
 				delete(queue.AckedAt, id)
+				s.totalMessages--
 				changed = true
 			}
 		}
@@ -597,6 +753,13 @@ func (s *service) listMessages(ctx context.Context, queueName string, filter mod
 	if err != nil {
 		return model.MessagePage{}, err
 	}
+	if filter.State != "" && filter.State != model.StateDelayed && filter.State != model.StateReady && filter.State != model.StateLeased && filter.State != model.StateAcked && filter.State != model.StateDead {
+		return model.MessagePage{}, invalid("message state filter is invalid")
+	}
+	expectedScope := cursorScope(queueName, filter.State, deadOnly)
+	if filter.Cursor != "" && cursor.Scope != expectedScope {
+		return model.MessagePage{}, invalid("cursor scope does not match request")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.checkOpenLocked(); err != nil {
@@ -606,32 +769,49 @@ func (s *service) listMessages(ctx context.Context, queueName string, filter mod
 	if !exists {
 		return model.MessagePage{}, notFound("queue not found")
 	}
-	now := s.clock.Now()
+	stats := s.journal.Stats()
+	var snapshotTime time.Time
+	if filter.Cursor == "" {
+		snapshotTime = s.clock.Now()
+		cursor.Scope = expectedScope
+		cursor.SnapshotLSN = stats.DurableLSN
+		cursor.SnapshotGeneration = stats.SnapshotGeneration
+		cursor.SnapshotSecond = snapshotTime.Unix()
+		cursor.SnapshotNanosecond = int32(snapshotTime.Nanosecond())
+		if s.state.NextSequence > 0 {
+			cursor.HighWater = s.state.NextSequence - 1
+		}
+	} else if cursor.SnapshotLSN == 0 || cursor.SnapshotLSN > stats.DurableLSN || cursor.SnapshotGeneration != stats.SnapshotGeneration {
+		return model.MessagePage{}, invalid("cursor snapshot is unavailable")
+	} else {
+		snapshotTime = time.Unix(cursor.SnapshotSecond, int64(cursor.SnapshotNanosecond))
+	}
 	matches := make([]*model.Message, 0)
 	for _, message := range queue.Messages {
-		state := logicalState(message, now, queue.Config.MaxDeliveries)
+		state := logicalState(message, snapshotTime, queue.Config.MaxDeliveries)
 		if deadOnly && state != model.StateDead {
 			continue
 		}
 		if !deadOnly && filter.State != "" && state != filter.State {
 			continue
 		}
-		if cursor > 0 && message.Sequence <= cursor {
+		if message.Sequence <= cursor.Sequence || message.Sequence > cursor.HighWater || message.LastLSN > cursor.SnapshotLSN {
 			continue
 		}
 		matches = append(matches, message)
 	}
 	sort.Slice(matches, func(i, j int) bool { return matches[i].Sequence < matches[j].Sequence })
-	page := model.MessagePage{SnapshotLSN: s.journal.Stats().DurableLSN}
+	page := model.MessagePage{SnapshotLSN: cursor.SnapshotLSN}
 	resultCount := min(len(matches), filter.Limit)
 	page.Messages = make([]model.Message, 0, resultCount)
 	for _, message := range matches[:resultCount] {
 		copy := cloneMessage(message)
-		copy.State = logicalState(message, now, queue.Config.MaxDeliveries)
+		copy.State = logicalState(message, snapshotTime, queue.Config.MaxDeliveries)
 		page.Messages = append(page.Messages, copy)
 	}
 	if len(matches) > filter.Limit {
-		page.NextCursor = encodeCursor(page.Messages[len(page.Messages)-1].Sequence)
+		cursor.Sequence = page.Messages[len(page.Messages)-1].Sequence
+		page.NextCursor = encodeCursor(cursor)
 	}
 	return page, nil
 }
@@ -681,13 +861,33 @@ func (s *service) Compact(ctx context.Context) error {
 	}
 	now := s.clock.Now()
 	original := s.state
+	originalTotalMessages := s.totalMessages
+	originalTotalInFlight := s.totalInFlight
+	originalInFlightByQueue := s.inFlightByQueue
 	s.state = checkpoint
-	for _, queue := range s.state.Queues {
+	s.inFlightByQueue = make(map[string]int, len(checkpoint.Queues))
+	s.totalMessages = 0
+	s.totalInFlight = 0
+	for name, queue := range s.state.Queues {
+		s.totalMessages += len(queue.Messages)
+		for _, message := range queue.Messages {
+			if message.State == model.StateLeased {
+				s.totalInFlight++
+				s.inFlightByQueue[name]++
+			}
+		}
 		s.materializeLocked(queue, now)
+		s.pruneRetentionLocked(queue, now)
 	}
 	s.pruneIdempotencyLocked(now)
 	checkpoint = s.state
+	checkpointTotalMessages := s.totalMessages
+	checkpointTotalInFlight := s.totalInFlight
+	checkpointInFlightByQueue := s.inFlightByQueue
 	s.state = original
+	s.totalMessages = originalTotalMessages
+	s.totalInFlight = originalTotalInFlight
+	s.inFlightByQueue = originalInFlightByQueue
 	stateBytes, err := json.Marshal(checkpoint)
 	if err != nil {
 		return &Error{Code: CodeStorageUnavailable, Message: "encode checkpoint state", Cause: err}
@@ -700,10 +900,9 @@ func (s *service) Compact(ctx context.Context) error {
 		return &Error{Code: CodeStorageUnavailable, Message: "checkpoint queue state", Cause: err}
 	}
 	s.state = checkpoint
-	s.totalMessages = 0
-	for _, queue := range checkpoint.Queues {
-		s.totalMessages += len(queue.Messages)
-	}
+	s.totalMessages = checkpointTotalMessages
+	s.totalInFlight = checkpointTotalInFlight
+	s.inFlightByQueue = checkpointInFlightByQueue
 	s.notifyLocked()
 	return nil
 }
@@ -725,16 +924,31 @@ func (s *service) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	if s.closed {
+	s.closeOnce.Do(func() {
+		s.submitMu.Lock()
+		s.stopping = true
+		s.mu.Lock()
+		s.closing = true
+		s.notifyLocked()
 		s.mu.Unlock()
-		return nil
+		close(s.mutationStop)
+		s.submitMu.Unlock()
+		go func() {
+			<-s.mutationDone
+			s.mu.Lock()
+			s.closed = true
+			s.notifyLocked()
+			s.mu.Unlock()
+			if err := s.journal.Close(); err != nil {
+				s.closeErr = &Error{Code: CodeStorageUnavailable, Message: "close journal", Cause: err}
+			}
+			close(s.closeDone)
+		}()
+	})
+	select {
+	case <-s.closeDone:
+		return s.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	s.closed = true
-	s.notifyLocked()
-	s.mu.Unlock()
-	if err := s.journal.Close(); err != nil {
-		return &Error{Code: CodeStorageUnavailable, Message: "close journal", Cause: err}
-	}
-	return nil
 }
