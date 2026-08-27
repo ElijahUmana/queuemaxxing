@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"time"
+	"unicode/utf8"
 
 	"github.com/ElijahUmana/queuemaxxing/internal/model"
 )
@@ -150,8 +151,8 @@ func (s *service) GetQueue(ctx context.Context, name string) (model.QueueInfo, e
 
 func (s *service) Enqueue(ctx context.Context, queueName string, request model.EnqueueRequest) (model.Message, bool, error) {
 	request = freezeEnqueueRequest(request)
-	if !json.Valid(request.Payload) {
-		return model.Message{}, false, invalid("payload must be valid JSON")
+	if !json.Valid(request.Payload) || !utf8.Valid(request.Payload) {
+		return model.Message{}, false, invalid("payload must be valid UTF-8 JSON")
 	}
 	if len(request.Payload) > s.limits.MaxPayloadBytes {
 		return model.Message{}, false, capacity("payload exceeds configured limit")
@@ -467,6 +468,9 @@ func (s *service) Nack(ctx context.Context, queueName string, request model.Nack
 	if request.MessageID == "" || request.Receipt == "" {
 		return model.Message{}, false, invalid("message id and receipt are required")
 	}
+	if !utf8.ValidString(request.Reason) {
+		return model.Message{}, false, invalid("reason must be valid UTF-8")
+	}
 	if request.Delay < 0 || request.Delay > s.limits.MaxDelay {
 		return model.Message{}, false, invalid("delay is outside configured bounds")
 	}
@@ -780,7 +784,7 @@ func (s *service) listMessages(ctx context.Context, queueName string, filter mod
 		cursor.SnapshotLSN = stats.DurableLSN
 		cursor.SnapshotGeneration = stats.SnapshotGeneration
 		cursor.SnapshotSecond = snapshotTime.Unix()
-		cursor.SnapshotNanosecond = int32(snapshotTime.Nanosecond())
+		cursor.SnapshotNanosecond = int32(snapshotTime.Nanosecond()) // #nosec G115 -- time.Nanosecond is always in [0, 1e9).
 		if s.state.NextSequence > 0 {
 			cursor.HighWater = s.state.NextSequence - 1
 		}

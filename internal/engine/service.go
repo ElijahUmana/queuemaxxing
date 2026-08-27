@@ -1,12 +1,14 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"reflect"
 	"strconv"
 	"strings"
@@ -436,31 +438,40 @@ func validReceipt(receipt, messageID string, epoch uint64) bool {
 	return err == nil
 }
 
+func decodeStrictResult(result json.RawMessage, target any) bool {
+	decoder := json.NewDecoder(bytes.NewReader(result))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return false
+	}
+	return decoder.Decode(&struct{}{}) == io.EOF
+}
+
 func validIdempotencyResult(operation string, result json.RawMessage) bool {
 	switch operation {
 	case operationCreateQueue:
 		var value queueMutationResult
-		return json.Unmarshal(result, &value) == nil && value.Info.Config.Name != ""
+		return decodeStrictResult(result, &value) && value.Info.Config.Name != ""
 	case operationEnqueue:
 		var value enqueueMutationResult
-		return json.Unmarshal(result, &value) == nil && value.Message.ID != ""
+		return decodeStrictResult(result, &value) && value.Message.ID != ""
 	case operationReceive:
 		var value receiveMutationResult
-		return json.Unmarshal(result, &value) == nil
+		return decodeStrictResult(result, &value)
 	case operationAck:
 		var value struct {
 			Acked bool `json:"acked"`
 		}
-		return json.Unmarshal(result, &value) == nil && value.Acked
+		return decodeStrictResult(result, &value) && value.Acked
 	case operationNack:
 		var value nackMutationResult
-		return json.Unmarshal(result, &value) == nil && value.Message.ID != ""
+		return decodeStrictResult(result, &value) && value.Message.ID != ""
 	case operationExtend:
 		var value extendMutationResult
-		return json.Unmarshal(result, &value) == nil && value.Delivery.Message.ID != ""
+		return decodeStrictResult(result, &value) && value.Delivery.Message.ID != ""
 	case operationRedrive:
 		var value redriveMutationResult
-		return json.Unmarshal(result, &value) == nil && value.Result.Source.ID != "" && value.Result.Child.ID != ""
+		return decodeStrictResult(result, &value) && value.Result.Source.ID != "" && value.Result.Child.ID != ""
 	default:
 		return false
 	}
@@ -1555,7 +1566,7 @@ func cursorScope(queue string, state model.MessageState, deadOnly bool) string {
 }
 
 func encodeCursor(cursor listCursor) string {
-	encodedSecond := uint64(cursor.SnapshotSecond) ^ (uint64(1) << 63)
+	encodedSecond := uint64(cursor.SnapshotSecond) ^ (uint64(1) << 63) // #nosec G115 -- bit-preserving signed-second encoding over all int64 values.
 	return fmt.Sprintf("%s%s.%020d.%020d.%020d.%020d.%020d.%09d", cursorPrefix, cursor.Scope, cursor.SnapshotLSN, cursor.HighWater, cursor.Sequence, cursor.SnapshotGeneration, encodedSecond, cursor.SnapshotNanosecond)
 }
 
@@ -1585,9 +1596,11 @@ func decodeCursor(encoded string) (listCursor, error) {
 	if values[5] >= uint64(time.Second) {
 		return listCursor{}, invalid("invalid cursor")
 	}
+	decodedSecond := int64(values[4] ^ (uint64(1) << 63)) // #nosec G115 -- inverse bit-preserving signed-second encoding.
+	nanosecond := int32(values[5])                        // #nosec G115 -- values[5] is checked below 1e9 above.
 	cursor := listCursor{
 		Scope: scope, SnapshotLSN: values[0], HighWater: values[1], Sequence: values[2], SnapshotGeneration: values[3],
-		SnapshotSecond: int64(values[4] ^ (uint64(1) << 63)), SnapshotNanosecond: int32(values[5]),
+		SnapshotSecond: decodedSecond, SnapshotNanosecond: nanosecond,
 	}
 	if cursor.Sequence > cursor.HighWater {
 		return listCursor{}, invalid("invalid cursor")
@@ -1597,8 +1610,12 @@ func decodeCursor(encoded string) (listCursor, error) {
 
 func normalizeReason(reason string) string {
 	reason = strings.TrimSpace(reason)
-	if len(reason) > 512 {
-		return reason[:512]
+	if len(reason) <= 512 {
+		return reason
 	}
-	return reason
+	end := 512
+	for end > 0 && !utf8.RuneStart(reason[end]) {
+		end--
+	}
+	return reason[:end]
 }

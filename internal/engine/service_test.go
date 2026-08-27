@@ -13,6 +13,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	queueclock "github.com/ElijahUmana/queuemaxxing/internal/clock"
 	"github.com/ElijahUmana/queuemaxxing/internal/journal"
@@ -2619,6 +2620,86 @@ func TestRecoveredCapabilityInvariantMatrix(t *testing.T) {
 	service.limits.MaxIdempotencyKeyBytes = 3
 	if err := service.validateRecoveredState(); err == nil {
 		t.Fatal("overlong recovered idempotency key accepted")
+	}
+}
+
+func TestUTF8PayloadAndReasonInvariants(t *testing.T) {
+	engine, store, clock := newTestService(t, model.FIFO, false, 3)
+	invalidPayload := json.RawMessage{0x22, 0xff, 0x22}
+	if !json.Valid(invalidPayload) || utf8.Valid(invalidPayload) {
+		t.Fatal("invalid UTF-8 JSON fixture is not shaped as expected")
+	}
+	if _, _, err := engine.Enqueue(context.Background(), "jobs", model.EnqueueRequest{Payload: invalidPayload}); !IsCode(err, CodeInvalid) {
+		t.Fatalf("invalid UTF-8 payload error = %v", err)
+	}
+
+	message := enqueueTest(t, engine, `{}`, 0, 0, "message")
+	delivery := receiveTest(t, engine, "receive")
+	if _, _, err := engine.Nack(context.Background(), "jobs", model.NackRequest{MessageID: message.ID, Receipt: delivery.Receipt, Reason: string([]byte{0xff})}); !IsCode(err, CodeInvalid) {
+		t.Fatalf("invalid UTF-8 reason error = %v", err)
+	}
+	reason := strings.Repeat("a", 511) + "€"
+	nacked, replayed, err := engine.Nack(context.Background(), "jobs", model.NackRequest{MessageID: message.ID, Receipt: delivery.Receipt, Reason: reason, IdempotencyKey: "nack"})
+	if err != nil || replayed || nacked.LastFailureReason != strings.Repeat("a", 511) || !utf8.ValidString(nacked.LastFailureReason) {
+		t.Fatalf("rune-safe nack = %+v/%t, %v", nacked, replayed, err)
+	}
+	again, replayed, err := engine.Nack(context.Background(), "jobs", model.NackRequest{MessageID: message.ID, Receipt: delivery.Receipt, Reason: reason, IdempotencyKey: "nack"})
+	if err != nil || !replayed || again.LastFailureReason != nacked.LastFailureReason {
+		t.Fatalf("rune-safe replay = %+v/%t, %v", again, replayed, err)
+	}
+	recoveredService, err := New(store, clock, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := recoveredService.ListMessages(context.Background(), "jobs", model.ListFilter{})
+	if err != nil || len(page.Messages) != 1 || page.Messages[0].LastFailureReason != nacked.LastFailureReason {
+		t.Fatalf("rune-safe recovery = %+v, %v", page, err)
+	}
+
+	state := validRecoveredState(clock.Now())
+	state.Queues["jobs"].Messages["ready"].Payload = invalidPayload
+	if err := validatePersistedState(state, 4); err == nil {
+		t.Fatal("invalid UTF-8 recovered payload accepted")
+	}
+}
+
+func TestStrictIdempotencyResultShapes(t *testing.T) {
+	if !validIdempotencyResult(operationReceive, json.RawMessage(`{}`)) {
+		t.Fatal("valid committed empty receive result rejected")
+	}
+	for operation, result := range map[string]json.RawMessage{
+		operationCreateQueue: json.RawMessage(`{}`),
+		operationEnqueue:     json.RawMessage(`{}`),
+		operationAck:         json.RawMessage(`{"acked":false}`),
+		operationNack:        json.RawMessage(`{"unknown":1}`),
+		operationExtend:      json.RawMessage(`{} {}`),
+		operationRedrive:     json.RawMessage(`{"result":{}}`),
+	} {
+		if validIdempotencyResult(operation, result) {
+			t.Fatalf("malformed %s result accepted: %s", operation, result)
+		}
+	}
+}
+
+func TestPersistedZeroSequenceFailsClosed(t *testing.T) {
+	state := validRecoveredState(time.Date(2026, 8, 26, 20, 0, 0, 0, time.UTC))
+	state.NextSequence = 0
+	if err := validatePersistedState(state, 4); err == nil {
+		t.Fatal("zero next sequence accepted")
+	}
+	service := &service{state: state, limits: DefaultLimits(), journal: &memoryJournal{records: []journal.Record{{LSN: 4}}}, clock: newFakeClock(time.Now())}
+	if err := service.validateRecoveredState(); err == nil || service.state.NextSequence != 0 {
+		t.Fatalf("zero sequence recovery = next %d, err %v", service.state.NextSequence, err)
+	}
+}
+
+func TestCursorSignedSecondExtremesRoundTrip(t *testing.T) {
+	for _, second := range []int64{math.MinInt64, -1, 0, 1, math.MaxInt64} {
+		cursor := listCursor{Scope: cursorScope("jobs", "", false), SnapshotLSN: 1, HighWater: 2, Sequence: 1, SnapshotGeneration: 3, SnapshotSecond: second, SnapshotNanosecond: 999_999_999}
+		decoded, err := decodeCursor(encodeCursor(cursor))
+		if err != nil || decoded != cursor {
+			t.Fatalf("cursor second %d round trip = %+v, %v", second, decoded, err)
+		}
 	}
 }
 
