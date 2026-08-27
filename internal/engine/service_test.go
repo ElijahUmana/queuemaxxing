@@ -2763,6 +2763,60 @@ func TestCoordinatorCanceledRequestNeverExecutesClosure(t *testing.T) {
 	}
 }
 
+func TestRecoveredRuntimeCapacityMatrix(t *testing.T) {
+	now := time.Date(2026, 8, 26, 20, 0, 0, 0, time.UTC)
+	cases := map[string]func(*persistedState, *Limits){
+		"queues": func(state *persistedState, limits *Limits) {
+			state.Queues["other"] = &queueState{Config: model.QueueConfig{Name: "other", Ordering: model.FIFO, DefaultVisibilityTimeout: time.Minute, MaxDeliveries: 1, CreatedAt: now}, Messages: map[string]*model.Message{}, Receipts: map[string]string{}, AckedAt: map[string]time.Time{}, AckedReceipts: map[string]ackReceipt{}}
+			limits.MaxQueues = 1
+		},
+		"queue-config":       func(_ *persistedState, limits *Limits) { limits.MaxVisibilityTimeout = time.Second },
+		"messages-per-queue": func(_ *persistedState, limits *Limits) { limits.MaxMessagesPerQueue = 3 },
+		"messages-total":     func(_ *persistedState, limits *Limits) { limits.MaxMessages = 3 },
+		"payload":            func(_ *persistedState, limits *Limits) { limits.MaxPayloadBytes = 1 },
+		"inflight-per-queue": func(_ *persistedState, limits *Limits) { limits.MaxInFlightPerQueue = 0 },
+		"inflight-total":     func(_ *persistedState, limits *Limits) { limits.MaxInFlight = 0 },
+		"idempotency-key": func(state *persistedState, limits *Limits) {
+			result, _ := json.Marshal(enqueueMutationResult{Message: cloneMessage(state.Queues["jobs"].Messages["ready"])})
+			record := idempotencyRecord{Operation: operationEnqueue, Queue: "jobs", Key: "long", Fingerprint: strings.Repeat("a", 64), Result: result, CreatedAt: now, ExpiresAt: now.Add(time.Hour), LastLSN: 4}
+			state.Idempotency[idempotencyID(record.Operation, record.Queue, record.Key)] = record
+			limits.MaxIdempotencyKeyBytes = 3
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			state, err := cloneStateForCheckpoint(validRecoveredState(now))
+			if err != nil {
+				t.Fatal(err)
+			}
+			limits := DefaultLimits()
+			mutate(&state, &limits)
+			service := &service{state: state, limits: limits, journal: &memoryJournal{records: []journal.Record{{LSN: 4}}}, clock: newFakeClock(now)}
+			if err := service.validateRecoveredState(); err == nil {
+				t.Fatal("over-capacity recovered state accepted")
+			}
+		})
+	}
+}
+
+func TestApplyEnvelopeRejectsMalformedInnerState(t *testing.T) {
+	service := &service{state: persistedState{Version: stateVersion, NextSequence: 1, Queues: map[string]*queueState{}, Idempotency: map[string]idempotencyRecord{}}}
+	for name, envelope := range map[string]persistedEnvelope{
+		"state-version": {Kind: "state", Version: stateVersion, State: json.RawMessage(`{"version":99,"next_sequence":1,"queues":{},"idempotency":{}}`)},
+		"invalid-state": {Kind: "state", Version: stateVersion, State: json.RawMessage(`{"version":1,"next_sequence":0,"queues":{},"idempotency":{}}`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			payload, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.applyEnvelope(payload, 1); err == nil {
+				t.Fatal("malformed inner state accepted")
+			}
+		})
+	}
+}
+
 func TestMutationCoordinatorInternalFailureBranchesRollback(t *testing.T) {
 	t.Run("encode-error", func(t *testing.T) {
 		engine, _, _ := newTestService(t, model.FIFO, false, 3)
