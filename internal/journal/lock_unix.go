@@ -13,12 +13,7 @@ type directoryLock struct {
 	file *os.File
 }
 
-func acquireDirectoryLock(path string) (*directoryLock, error) {
-	// #nosec G304 -- path is the fixed LOCK filename under the operator-selected store root.
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open journal lock: %w", err)
-	}
+func acquireDirectoryLock(file *os.File) (*directoryLock, error) {
 	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		_ = file.Close()
 		if errors.Is(err, syscall.EWOULDBLOCK) {

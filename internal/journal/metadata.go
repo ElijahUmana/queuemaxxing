@@ -65,8 +65,7 @@ func decodeHead(path string, encoded []byte) (headState, error) {
 
 func (journal *FileJournal) loadHead() (headState, bool, error) {
 	path := filepath.Join(journal.dir, "HEAD")
-	// #nosec G304 -- path is the fixed HEAD filename under the locked store root.
-	encoded, err := os.ReadFile(path)
+	encoded, err := journal.readFile(path)
 	if os.IsNotExist(err) {
 		return headState{}, false, nil
 	}
@@ -83,8 +82,7 @@ func (journal *FileJournal) loadHead() (headState, bool, error) {
 func (journal *FileJournal) persistHeadLocked(head headState) error {
 	path := filepath.Join(journal.dir, "HEAD")
 	temporary := path + ".tmp"
-	// #nosec G304 -- temporary is the fixed HEAD.tmp filename under the locked store root.
-	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	file, err := journal.openFile(temporary, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -92,7 +90,7 @@ func (journal *FileJournal) persistHeadLocked(head headState) error {
 	defer func() {
 		_ = file.Close()
 		if cleanup {
-			_ = os.Remove(temporary)
+			_ = journal.remove(temporary)
 		}
 	}()
 	if err := journal.writeLocked(file, temporary, encodeHead(head)); err != nil {
@@ -109,7 +107,7 @@ func (journal *FileJournal) persistHeadLocked(head headState) error {
 			return err
 		}
 	}
-	if err := replaceFile(temporary, path); err != nil {
+	if err := journal.rename(temporary, path); err != nil {
 		return err
 	}
 	cleanup = false

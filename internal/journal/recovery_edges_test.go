@@ -10,6 +10,16 @@ import (
 	"testing"
 )
 
+func newRootedTestJournal(t *testing.T, dir string) *FileJournal {
+	t.Helper()
+	instance := &FileJournal{dir: dir, walDir: filepath.Join(dir, "wal"), snapshotDir: filepath.Join(dir, "snapshots")}
+	if err := instance.openRoot(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = instance.root.Close() })
+	return instance
+}
+
 func TestRecoverSegmentsRejectsInvalidHistories(t *testing.T) {
 	storeID := [16]byte{1}
 	otherID := [16]byte{2}
@@ -34,7 +44,7 @@ func TestRecoverSegmentsRejectsInvalidHistories(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			dir := t.TempDir()
 			paths := writeRecoverySegments(t, dir, test.segments)
-			instance := &FileJournal{dir: dir, walDir: filepath.Join(dir, "wal"), snapshotDir: filepath.Join(dir, "snapshots")}
+			instance := newRootedTestJournal(t, dir)
 			if err := os.MkdirAll(instance.snapshotDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -65,7 +75,7 @@ func TestRecoverSegmentsRejectsBrokenSecondSegment(t *testing.T) {
 				{header: segmentHeader{StoreID: storeID, ID: 1, FirstLSN: 1}, records: []Record{{LSN: 1}}},
 				{header: test.second, records: []Record{{LSN: 2}}},
 			})
-			instance := &FileJournal{dir: dir, walDir: filepath.Join(dir, "wal"), snapshotDir: filepath.Join(dir, "snapshots")}
+			instance := newRootedTestJournal(t, dir)
 			if err := os.MkdirAll(instance.snapshotDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -96,7 +106,7 @@ func TestRecoverSegmentsUsesExactAndFallbackSnapshots(t *testing.T) {
 				records = append(records, Record{LSN: lsn})
 			}
 			paths := writeRecoverySegments(t, dir, []recoverySegment{{header: segmentHeader{StoreID: storeID, ID: 1, FirstLSN: 1}, records: records}})
-			instance := &FileJournal{dir: dir, walDir: filepath.Join(dir, "wal"), snapshotDir: filepath.Join(dir, "snapshots")}
+			instance := newRootedTestJournal(t, dir)
 			if err := os.MkdirAll(instance.snapshotDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
@@ -115,7 +125,7 @@ func TestInterruptedSegmentReconciliationConflicts(t *testing.T) {
 		t.Fatal(err)
 	}
 	paths := writeRecoverySegments(t, dir, []recoverySegment{{header: segmentHeader{ID: 1}}, {header: segmentHeader{ID: 2}}})
-	instance := &FileJournal{dir: dir, walDir: walDir, snapshotDir: filepath.Join(dir, "snapshots")}
+	instance := newRootedTestJournal(t, dir)
 	kept, err := instance.reconcileInterruptedSegmentPublication(paths, 1)
 	if err != nil || len(kept) != 1 {
 		t.Fatalf("kept=%v error=%v", kept, err)
@@ -143,7 +153,8 @@ func TestTailRepairEvidenceConflictAndTruncateFailure(t *testing.T) {
 	if err := os.WriteFile(path, []byte("original"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	instance := &FileJournal{dir: dir, walDir: walDir, faults: FaultHooks{BeforeTruncate: func(string, int64) error { return errInjected }}}
+	instance := newRootedTestJournal(t, dir)
+	instance.faults = FaultHooks{BeforeTruncate: func(string, int64) error { return errInjected }}
 	if err := instance.repairTail(path, 0, []byte("suffix")); !errors.Is(err, errInjected) {
 		t.Fatalf("truncate error = %v", err)
 	}
@@ -204,12 +215,13 @@ func TestRepairTailSyncFailures(t *testing.T) {
 			if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			instance := &FileJournal{dir: dir, walDir: walDir, faults: FaultHooks{BeforeSync: func(path string) error {
+			instance := newRootedTestJournal(t, dir)
+			instance.faults = FaultHooks{BeforeSync: func(path string) error {
 				if (failBase == "store" && path == dir) || (failBase == "quarantine" && filepath.Base(path) == "quarantine") {
 					return errInjected
 				}
 				return nil
-			}}}
+			}}
 			if err := instance.repairTail(path, 2, []byte("ta")); !errors.Is(err, errInjected) {
 				t.Fatalf("error = %v", err)
 			}
@@ -227,7 +239,7 @@ func TestRepairTailEmptyAndMatchingEvidence(t *testing.T) {
 	if err := os.WriteFile(path, []byte("data"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	instance := &FileJournal{dir: dir, walDir: walDir}
+	instance := newRootedTestJournal(t, dir)
 	if err := instance.repairTail(path, 2, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +260,8 @@ func TestRepairTailEmptyAndMatchingEvidence(t *testing.T) {
 
 func TestSnapshotPruningAndNoopCompaction(t *testing.T) {
 	dir := t.TempDir()
-	instance := &FileJournal{dir: dir, walDir: filepath.Join(dir, "wal"), snapshotDir: filepath.Join(dir, "snapshots"), head: headState{WALFloor: 1}}
+	instance := newRootedTestJournal(t, dir)
+	instance.head = headState{WALFloor: 1}
 	if err := os.MkdirAll(instance.walDir, 0o700); err != nil {
 		t.Fatal(err)
 	}

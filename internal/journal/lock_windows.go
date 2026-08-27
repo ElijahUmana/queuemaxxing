@@ -26,11 +26,7 @@ type directoryLock struct {
 	file *os.File
 }
 
-func acquireDirectoryLock(path string) (*directoryLock, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open journal lock: %w", err)
-	}
+func acquireDirectoryLock(file *os.File) (*directoryLock, error) {
 	var overlapped syscall.Overlapped
 	result, _, callErr := procLockFileEx.Call(
 		file.Fd(),

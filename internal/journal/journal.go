@@ -28,6 +28,12 @@ const (
 	snapshotTrailerSize = 48
 	defaultSegmentSize  = int64(64 << 20)
 	maxPayloadSize      = uint32(64 << 20)
+	maxAppendRecords    = 1024
+	maxAppendBytes      = int(maxPayloadSize) + recordHeaderSize + recordTrailerSize
+	maxCommitRequests   = 64
+	maxCommitBytes      = 4 << 20
+	commitQueueCapacity = 256
+	commitDelay         = 250 * time.Microsecond
 	recordKindData      = uint16(1)
 )
 
@@ -47,6 +53,7 @@ var (
 	ErrCorrupt      = errors.New("journal is corrupt")
 	ErrInvalidLSN   = errors.New("invalid checkpoint LSN")
 	ErrPayloadLarge = errors.New("journal payload exceeds maximum size")
+	ErrBatchLarge   = errors.New("journal append batch exceeds maximum size")
 )
 
 type CorruptionError struct {
@@ -69,6 +76,7 @@ type FaultHooks struct {
 	BeforeRename   func(oldPath, newPath string) error
 	BeforeRemove   func(path string) error
 	BeforeTruncate func(path string, size int64) error
+	BeforeClose    func(resource string) error
 }
 
 type Config struct {
@@ -78,8 +86,28 @@ type Config struct {
 	Faults      FaultHooks
 }
 
+type appendResult struct {
+	lsns []uint64
+	err  error
+}
+
+type appendRequest struct {
+	ctx     context.Context
+	records []Record
+	bytes   int
+	result  chan appendResult
+}
+
 type FileJournal struct {
 	mu sync.RWMutex
+
+	submitMu       sync.RWMutex
+	commitCh       chan appendRequest
+	commitStop     chan struct{}
+	commitDone     chan struct{}
+	closeDone      chan struct{}
+	stopping       bool
+	committerAlive bool
 
 	dir         string
 	walDir      string
@@ -88,6 +116,7 @@ type FileJournal struct {
 	now         func() time.Time
 	faults      FaultHooks
 	lock        *directoryLock
+	root        *os.Root
 
 	storeID    [16]byte
 	active     *os.File
@@ -105,6 +134,7 @@ type FileJournal struct {
 	lastSync   *time.Time
 	readOnly   bool
 	readReason string
+	closeErr   error
 	closed     bool
 }
 
@@ -144,10 +174,6 @@ func Open(config Config) (*FileJournal, error) {
 	if err := syncDirectory(filepath.Dir(config.Dir)); err != nil {
 		return nil, fmt.Errorf("sync journal parent directory: %w", err)
 	}
-	lock, err := acquireDirectoryLock(filepath.Join(config.Dir, "LOCK"))
-	if err != nil {
-		return nil, err
-	}
 	journal := &FileJournal{
 		dir:         config.Dir,
 		walDir:      filepath.Join(config.Dir, "wal"),
@@ -155,36 +181,78 @@ func Open(config Config) (*FileJournal, error) {
 		segmentSize: config.SegmentSize,
 		now:         config.Now,
 		faults:      config.Faults,
-		lock:        lock,
+		commitCh:    make(chan appendRequest, commitQueueCapacity),
+		commitStop:  make(chan struct{}),
+		commitDone:  make(chan struct{}),
+		closeDone:   make(chan struct{}),
 		nextLSN:     1,
 	}
+	if err := journal.openRoot(); err != nil {
+		return nil, fmt.Errorf("open journal root: %w", err)
+	}
+	lockFile, err := journal.openFile(filepath.Join(config.Dir, "LOCK"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		_ = journal.root.Close()
+		return nil, fmt.Errorf("open journal lock: %w", err)
+	}
+	lock, err := acquireDirectoryLock(lockFile)
+	if err != nil {
+		_ = lockFile.Close()
+		_ = journal.root.Close()
+		return nil, err
+	}
+	journal.lock = lock
 	if err := journal.open(); err != nil {
 		_ = journal.Close()
 		return nil, err
 	}
+	journal.committerAlive = true
+	go journal.runCommitter()
 	return journal, nil
 }
 
 func (journal *FileJournal) open() error {
-	if err := os.MkdirAll(journal.walDir, 0o700); err != nil {
+	if err := journal.ensureDirectory(journal.walDir, 0o700); err != nil {
 		return fmt.Errorf("create WAL directory: %w", err)
 	}
-	if err := os.MkdirAll(journal.snapshotDir, 0o700); err != nil {
+	if err := journal.ensureDirectory(journal.snapshotDir, 0o700); err != nil {
 		return fmt.Errorf("create snapshot directory: %w", err)
+	}
+	if err := journal.restrictStorageModes(); err != nil {
+		return fmt.Errorf("restrict journal storage permissions: %w", err)
 	}
 	if err := journal.removeInterruptedPublications(); err != nil {
 		return err
 	}
-	if err := syncDirectory(journal.dir); err != nil {
+	if err := journal.syncDirectoryLocked(journal.dir); err != nil {
 		return fmt.Errorf("sync journal directory: %w", err)
 	}
 	head, hasHead, err := journal.loadHead()
 	if err != nil {
 		return err
 	}
-	snapshots, err := journal.loadSnapshots()
+	snapshots, invalidSnapshots, err := journal.loadSnapshots()
 	if err != nil {
 		return err
+	}
+	if len(invalidSnapshots) > 0 {
+		if err := journal.quarantineInvalidSnapshots(invalidSnapshots); err != nil {
+			return err
+		}
+		if len(snapshots) == 0 {
+			causes := make([]error, 0, len(invalidSnapshots))
+			for _, invalid := range invalidSnapshots {
+				causes = append(causes, invalid.err)
+			}
+			return errors.Join(causes...)
+		}
+		snapshots, invalidSnapshots, err = journal.loadSnapshots()
+		if err != nil {
+			return err
+		}
+		if len(invalidSnapshots) != 0 {
+			return errors.New("invalid snapshots remain after quarantine")
+		}
 	}
 	segments, err := journal.segmentPaths()
 	if err != nil {
@@ -216,9 +284,22 @@ func (journal *FileJournal) open() error {
 	if err := journal.reconcileUncommittedSnapshots(head); err != nil {
 		return err
 	}
-	snapshots, err = journal.loadSnapshots()
+	snapshots, invalidSnapshots, err = journal.loadSnapshots()
 	if err != nil {
 		return err
+	}
+	if len(invalidSnapshots) != 0 {
+		return errors.New("invalid snapshots appeared during startup reconciliation")
+	}
+	if err := journal.reconcileUnusableHeadSnapshot(head, snapshots); err != nil {
+		return err
+	}
+	snapshots, invalidSnapshots, err = journal.loadSnapshots()
+	if err != nil {
+		return err
+	}
+	if len(invalidSnapshots) != 0 {
+		return errors.New("invalid snapshots appeared during startup reconciliation")
 	}
 	metas, recovered, storeID, err := journal.recoverSegments(segments, snapshots, head)
 	if err != nil {
@@ -242,7 +323,7 @@ func (journal *FileJournal) open() error {
 		if last.lastLSN == 0 {
 			journal.nextLSN = last.firstLSN
 		}
-		journal.active, err = os.OpenFile(last.path, os.O_RDWR|os.O_APPEND, 0o600)
+		journal.active, err = journal.openFile(last.path, os.O_RDWR|os.O_APPEND, 0o600)
 		if err != nil {
 			return fmt.Errorf("open active WAL segment: %w", err)
 		}
@@ -250,11 +331,83 @@ func (journal *FileJournal) open() error {
 	return nil
 }
 
+func (journal *FileJournal) quarantineInvalidSnapshots(invalid []invalidSnapshot) error {
+	quarantineDir := filepath.Join(journal.dir, "quarantine")
+	if err := journal.ensureDirectory(quarantineDir, 0o700); err != nil {
+		return err
+	}
+	if err := journal.syncDirectoryLocked(journal.dir); err != nil {
+		return err
+	}
+	for _, candidate := range invalid {
+		destination := filepath.Join(quarantineDir, filepath.Base(candidate.path)+".corrupt")
+		if _, err := journal.lstat(destination); err == nil {
+			return &CorruptionError{Path: destination, Reason: "invalid snapshot quarantine destination already exists"}
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := journal.rename(candidate.path, destination); err != nil {
+			return err
+		}
+	}
+	if err := journal.syncDirectoryLocked(quarantineDir); err != nil {
+		return err
+	}
+	return journal.syncDirectoryLocked(journal.snapshotDir)
+}
+
+func (journal *FileJournal) reconcileUnusableHeadSnapshot(head headState, valid []snapshotCandidate) error {
+	if head.SnapshotGeneration == 0 {
+		return nil
+	}
+	for _, candidate := range valid {
+		if candidate.storeID == head.StoreID && candidate.snapshot.Generation == head.SnapshotGeneration && candidate.snapshot.ThroughLSN == head.SnapshotThroughLSN {
+			return nil
+		}
+	}
+	fallback := false
+	for _, candidate := range valid {
+		if candidate.storeID == head.StoreID && candidate.snapshot.Generation < head.SnapshotGeneration {
+			fallback = true
+			break
+		}
+	}
+	if !fallback {
+		return nil
+	}
+	path := filepath.Join(journal.snapshotDir, snapshotName(head.SnapshotGeneration, head.SnapshotThroughLSN))
+	if _, err := journal.lstat(path); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	quarantineDir := filepath.Join(journal.dir, "quarantine")
+	if err := journal.ensureDirectory(quarantineDir, 0o700); err != nil {
+		return err
+	}
+	if err := journal.syncDirectoryLocked(journal.dir); err != nil {
+		return err
+	}
+	destination := filepath.Join(quarantineDir, filepath.Base(path)+".corrupt")
+	if _, err := journal.lstat(destination); err == nil {
+		return &CorruptionError{Path: destination, Reason: "corrupt snapshot quarantine destination already exists"}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := journal.rename(path, destination); err != nil {
+		return err
+	}
+	if err := journal.syncDirectoryLocked(quarantineDir); err != nil {
+		return err
+	}
+	return journal.syncDirectoryLocked(journal.snapshotDir)
+}
+
 func (journal *FileJournal) recoverInterruptedInitialization(segments []string, snapshots []snapshotCandidate) error {
 	if len(segments) != 1 || len(snapshots) != 0 {
 		return &CorruptionError{Path: filepath.Join(journal.dir, "HEAD"), Reason: "WAL segments exist without durable head metadata"}
 	}
-	contents, err := os.ReadFile(segments[0])
+	contents, err := journal.readFile(segments[0])
 	if err != nil {
 		return err
 	}
@@ -271,7 +424,7 @@ func (journal *FileJournal) recoverInterruptedInitialization(segments []string, 
 	journal.activeSize = int64(segmentHeaderSize)
 	journal.walBytes = int64(segmentHeaderSize)
 	journal.segments = 1
-	journal.active, err = os.OpenFile(segments[0], os.O_RDWR|os.O_APPEND, 0o600)
+	journal.active, err = journal.openFile(segments[0], os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -279,9 +432,12 @@ func (journal *FileJournal) recoverInterruptedInitialization(segments []string, 
 }
 
 func (journal *FileJournal) reconcileUncommittedSnapshots(head headState) error {
-	candidates, err := journal.loadSnapshots()
+	candidates, invalid, err := journal.loadSnapshots()
 	if err != nil {
 		return err
+	}
+	if len(invalid) != 0 {
+		return errors.New("invalid snapshots appeared during startup reconciliation")
 	}
 	quarantine := make([]snapshotCandidate, 0)
 	for _, candidate := range candidates {
@@ -293,7 +449,7 @@ func (journal *FileJournal) reconcileUncommittedSnapshots(head headState) error 
 		return nil
 	}
 	quarantineDir := filepath.Join(journal.dir, "quarantine")
-	if err := os.MkdirAll(quarantineDir, 0o700); err != nil {
+	if err := journal.ensureDirectory(quarantineDir, 0o700); err != nil {
 		return err
 	}
 	if err := journal.syncDirectoryLocked(journal.dir); err != nil {
@@ -301,12 +457,12 @@ func (journal *FileJournal) reconcileUncommittedSnapshots(head headState) error 
 	}
 	for _, candidate := range quarantine {
 		destination := filepath.Join(quarantineDir, filepath.Base(candidate.path)+".uncommitted")
-		if _, err := os.Stat(destination); err == nil {
+		if _, err := journal.lstat(destination); err == nil {
 			return &CorruptionError{Path: destination, Reason: "uncommitted snapshot quarantine destination already exists"}
 		} else if !os.IsNotExist(err) {
 			return err
 		}
-		if err := os.Rename(candidate.path, destination); err != nil {
+		if err := journal.rename(candidate.path, destination); err != nil {
 			return err
 		}
 	}
@@ -318,35 +474,49 @@ func (journal *FileJournal) reconcileUncommittedSnapshots(head headState) error 
 
 func (journal *FileJournal) removeInterruptedPublications() error {
 	for _, path := range []string{filepath.Join(journal.dir, "HEAD.tmp"), journal.walDir, journal.snapshotDir} {
-		info, err := os.Stat(path)
+		info, err := journal.lstat(path)
 		if os.IsNotExist(err) {
 			continue
 		}
 		if err != nil {
 			return err
 		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("journal path is a symbolic link: %s", path)
+		}
 		if !info.IsDir() {
-			if err := os.Remove(path); err != nil {
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("journal publication is not a regular file: %s", path)
+			}
+			if err := journal.remove(path); err != nil {
 				return fmt.Errorf("remove interrupted publication %s: %w", path, err)
 			}
 			continue
 		}
-		entries, err := os.ReadDir(path)
+		entries, err := journal.readDir(path)
 		if err != nil {
 			return err
 		}
 		removed := false
 		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".tmp") {
+			if !strings.HasSuffix(entry.Name(), ".tmp") {
 				continue
 			}
-			if err := os.Remove(filepath.Join(path, entry.Name())); err != nil {
+			entryPath := filepath.Join(path, entry.Name())
+			entryInfo, err := journal.lstat(entryPath)
+			if err != nil {
+				return err
+			}
+			if !entryInfo.Mode().IsRegular() {
+				return fmt.Errorf("interrupted publication is not a regular file: %s", entryPath)
+			}
+			if err := journal.remove(entryPath); err != nil {
 				return fmt.Errorf("remove interrupted publication %s: %w", entry.Name(), err)
 			}
 			removed = true
 		}
 		if removed {
-			if err := syncDirectory(path); err != nil {
+			if err := journal.syncDirectoryLocked(path); err != nil {
 				return err
 			}
 		}
@@ -362,6 +532,29 @@ func (journal *FileJournal) Append(ctx context.Context, transactionID Transactio
 	return records[0], nil
 }
 
+func validateAppendBatchSize(records int, payloadSize func(int) int) (int, error) {
+	if records > maxAppendRecords {
+		return 0, ErrBatchLarge
+	}
+	totalBytes := 0
+	for index := 0; index < records; index++ {
+		payloadBytes := payloadSize(index)
+		if payloadBytes > int(maxPayloadSize) {
+			return 0, ErrPayloadLarge
+		}
+		frameBytes := recordHeaderSize + payloadBytes + recordTrailerSize
+		if frameBytes > maxAppendBytes-totalBytes {
+			return 0, ErrBatchLarge
+		}
+		totalBytes += frameBytes
+	}
+	return totalBytes, nil
+}
+
+func validateAppendBatch(input []Record) (int, error) {
+	return validateAppendBatchSize(len(input), func(index int) int { return len(input[index].Payload) })
+}
+
 func (journal *FileJournal) AppendBatch(ctx context.Context, input []Record) ([]uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -369,31 +562,145 @@ func (journal *FileJournal) AppendBatch(ctx context.Context, input []Record) ([]
 	if len(input) == 0 {
 		return []uint64{}, nil
 	}
-	for index := range input {
-		if len(input[index].Payload) > int(maxPayloadSize) {
-			return nil, ErrPayloadLarge
-		}
-	}
-
-	journal.mu.Lock()
-	defer journal.mu.Unlock()
-	if err := ctx.Err(); err != nil {
+	totalBytes, err := validateAppendBatch(input)
+	if err != nil {
 		return nil, err
 	}
+	request := appendRequest{ctx: ctx, records: make([]Record, len(input)), bytes: totalBytes, result: make(chan appendResult, 1)}
+	for index := range input {
+		request.records[index] = Record{TransactionID: input[index].TransactionID, Payload: bytes.Clone(input[index].Payload)}
+	}
+
+	journal.submitMu.RLock()
+	if journal.stopping {
+		journal.submitMu.RUnlock()
+		return nil, ErrClosed
+	}
+	select {
+	case journal.commitCh <- request:
+		journal.submitMu.RUnlock()
+	case <-ctx.Done():
+		journal.submitMu.RUnlock()
+		return nil, ctx.Err()
+	}
+	result := <-request.result
+	return result.lsns, result.err
+}
+
+func (journal *FileJournal) runCommitter() {
+	defer close(journal.commitDone)
+	for {
+		select {
+		case first := <-journal.commitCh:
+			batch := []appendRequest{first}
+			bytes := first.bytes
+			timer := time.NewTimer(commitDelay)
+		collect:
+			for len(batch) < maxCommitRequests && bytes < maxCommitBytes {
+				select {
+				case request := <-journal.commitCh:
+					if len(batch) > 0 && bytes+request.bytes > maxCommitBytes {
+						journal.commitBatch(batch)
+						batch = batch[:0]
+						bytes = 0
+					}
+					batch = append(batch, request)
+					bytes += request.bytes
+				case <-timer.C:
+					break collect
+				case <-journal.commitStop:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					journal.commitBatch(batch)
+					journal.drainAccepted()
+					return
+				}
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			journal.commitBatch(batch)
+		case <-journal.commitStop:
+			journal.drainAccepted()
+			return
+		}
+	}
+}
+
+func (journal *FileJournal) drainAccepted() {
+	batch := make([]appendRequest, 0, maxCommitRequests)
+	bytes := 0
+	for {
+		select {
+		case request := <-journal.commitCh:
+			if len(batch) > 0 && (len(batch) == maxCommitRequests || bytes+request.bytes > maxCommitBytes) {
+				journal.commitBatch(batch)
+				batch = batch[:0]
+				bytes = 0
+			}
+			batch = append(batch, request)
+			bytes += request.bytes
+		default:
+			journal.commitBatch(batch)
+			return
+		}
+	}
+}
+
+func (journal *FileJournal) commitBatch(requests []appendRequest) {
+	journal.mu.Lock()
+	active := requests[:0]
+	for _, request := range requests {
+		if err := request.ctx.Err(); err != nil {
+			request.result <- appendResult{err: err}
+			continue
+		}
+		active = append(active, request)
+	}
+	if len(active) == 0 {
+		journal.mu.Unlock()
+		return
+	}
+	results, err := journal.appendLocked(active)
+	journal.mu.Unlock()
+	if err != nil {
+		for _, request := range active {
+			request.result <- appendResult{err: err}
+		}
+		return
+	}
+	for index, request := range active {
+		request.result <- appendResult{lsns: results[index]}
+	}
+}
+
+func (journal *FileJournal) appendLocked(requests []appendRequest) ([][]uint64, error) {
 	if err := journal.writable(); err != nil {
 		return nil, err
 	}
 
-	encoded := make([][]byte, len(input))
-	committed := make([]Record, len(input))
-	lsns := make([]uint64, len(input))
+	results := make([][]uint64, len(requests))
+	committed := make([]Record, 0)
+	frames := make([][]byte, 0)
 	total := 0
-	for index := range input {
-		lsn := journal.nextLSN + uint64(index)
-		committed[index] = Record{LSN: lsn, TransactionID: input[index].TransactionID, Payload: bytes.Clone(input[index].Payload)}
-		encoded[index] = encodeRecord(committed[index])
-		total += len(encoded[index])
-		lsns[index] = lsn
+	for requestIndex, request := range requests {
+		results[requestIndex] = make([]uint64, len(request.records))
+		for recordIndex, input := range request.records {
+			lsn := journal.nextLSN + uint64(len(committed))
+			record := Record{LSN: lsn, TransactionID: input.TransactionID, Payload: input.Payload}
+			frame := encodeRecord(record)
+			committed = append(committed, record)
+			frames = append(frames, frame)
+			results[requestIndex][recordIndex] = lsn
+			total += len(frame)
+		}
 	}
 	if journal.activeSize > segmentHeaderSize && journal.activeSize+int64(total) > journal.segmentSize {
 		if err := journal.rotateLocked(); err != nil {
@@ -401,7 +708,7 @@ func (journal *FileJournal) AppendBatch(ctx context.Context, input []Record) ([]
 		}
 	}
 	buffer := make([]byte, 0, total)
-	for _, frame := range encoded {
+	for _, frame := range frames {
 		buffer = append(buffer, frame...)
 	}
 	if err := journal.writeLocked(journal.active, journal.activePath, buffer); err != nil {
@@ -412,7 +719,7 @@ func (journal *FileJournal) AppendBatch(ctx context.Context, input []Record) ([]
 	if err := journal.syncLocked(journal.active, journal.activePath); err != nil {
 		return nil, journal.failLocked("sync WAL", err)
 	}
-	committedLSN := lsns[len(lsns)-1]
+	committedLSN := committed[len(committed)-1].LSN
 	head := journal.head
 	head.StoreID = journal.storeID
 	head.WALHead = journal.activeID
@@ -424,7 +731,7 @@ func (journal *FileJournal) AppendBatch(ctx context.Context, input []Record) ([]
 	journal.lastSync = &now
 	journal.records = append(journal.records, committed...)
 	journal.nextLSN += uint64(len(committed))
-	return lsns, nil
+	return results, nil
 }
 
 func (journal *FileJournal) Checkpoint(ctx context.Context, throughLSN uint64, payload []byte) error {
@@ -450,8 +757,7 @@ func (journal *FileJournal) Checkpoint(ctx context.Context, throughLSN uint64, p
 	path := filepath.Join(journal.snapshotDir, snapshotName(generation, throughLSN))
 	temporary := path + ".tmp"
 	encoded := encodeSnapshot(journal.storeID, snapshot)
-	// #nosec G304 -- temporary is a generated snapshot filename beneath the fixed snapshot directory.
-	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	file, err := journal.openFile(temporary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return journal.failLocked("create snapshot", err)
 	}
@@ -459,7 +765,7 @@ func (journal *FileJournal) Checkpoint(ctx context.Context, throughLSN uint64, p
 	defer func() {
 		_ = file.Close()
 		if cleanup {
-			_ = os.Remove(temporary)
+			_ = journal.remove(temporary)
 		}
 	}()
 	if err := journal.writeLocked(file, temporary, encoded); err != nil {
@@ -471,8 +777,7 @@ func (journal *FileJournal) Checkpoint(ctx context.Context, throughLSN uint64, p
 	if err := file.Close(); err != nil {
 		return journal.failLocked("close snapshot", err)
 	}
-	// #nosec G304 -- temporary is the same internally generated snapshot path written above.
-	contents, err := os.ReadFile(temporary)
+	contents, err := journal.readFile(temporary)
 	if err != nil {
 		return journal.failLocked("verify snapshot", err)
 	}
@@ -488,7 +793,7 @@ func (journal *FileJournal) Checkpoint(ctx context.Context, throughLSN uint64, p
 			return journal.failLocked("publish snapshot", err)
 		}
 	}
-	if err := os.Rename(temporary, path); err != nil {
+	if err := journal.rename(temporary, path); err != nil {
 		return journal.failLocked("publish snapshot", err)
 	}
 	cleanup = false
@@ -555,21 +860,59 @@ func (journal *FileJournal) Stats() Stats {
 }
 
 func (journal *FileJournal) Close() error {
+	journal.submitMu.Lock()
+	if journal.stopping {
+		closeDone := journal.closeDone
+		journal.submitMu.Unlock()
+		<-closeDone
+		journal.mu.RLock()
+		result := journal.closeErr
+		journal.mu.RUnlock()
+		return result
+	}
+	journal.stopping = true
+	alive := journal.committerAlive
+	if alive {
+		close(journal.commitStop)
+	}
+	journal.submitMu.Unlock()
+	if alive {
+		<-journal.commitDone
+	}
+
 	journal.mu.Lock()
-	defer journal.mu.Unlock()
 	if journal.closed {
-		return nil
+		result := journal.closeErr
+		journal.mu.Unlock()
+		close(journal.closeDone)
+		return result
 	}
 	journal.closed = true
 	var result error
 	if journal.active != nil {
-		result = journal.active.Close()
+		if journal.faults.BeforeClose != nil {
+			result = errors.Join(result, journal.faults.BeforeClose("active WAL"))
+		}
+		result = errors.Join(result, journal.active.Close())
 		journal.active = nil
 	}
 	if journal.lock != nil {
+		if journal.faults.BeforeClose != nil {
+			result = errors.Join(result, journal.faults.BeforeClose("directory lock"))
+		}
 		result = errors.Join(result, journal.lock.Close())
 		journal.lock = nil
 	}
+	if journal.root != nil {
+		if journal.faults.BeforeClose != nil {
+			result = errors.Join(result, journal.faults.BeforeClose("storage root"))
+		}
+		result = errors.Join(result, journal.root.Close())
+		journal.root = nil
+	}
+	journal.closeErr = result
+	journal.mu.Unlock()
+	close(journal.closeDone)
 	return result
 }
 
@@ -629,7 +972,12 @@ func (journal *FileJournal) syncDirectoryLocked(path string) error {
 			return err
 		}
 	}
-	return syncDirectory(path)
+	directory, err := journal.openFile(path, os.O_RDONLY, 0)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func (journal *FileJournal) rotateLocked() error {
@@ -642,7 +990,7 @@ func (journal *FileJournal) rotateLocked() error {
 	if err := journal.active.Close(); err != nil {
 		return err
 	}
-	contents, err := os.ReadFile(journal.activePath)
+	contents, err := journal.readFile(journal.activePath)
 	if err != nil {
 		return err
 	}
@@ -659,8 +1007,7 @@ func (journal *FileJournal) rotateLocked() error {
 func (journal *FileJournal) createSegment(id, firstLSN uint64, previous [32]byte) error {
 	path := filepath.Join(journal.walDir, segmentName(id))
 	temporary := path + ".tmp"
-	// #nosec G304 -- temporary is a generated segment filename beneath the fixed WAL directory.
-	file, err := os.OpenFile(temporary, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+	file, err := journal.openFile(temporary, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return fmt.Errorf("create WAL segment: %w", err)
 	}
@@ -668,7 +1015,7 @@ func (journal *FileJournal) createSegment(id, firstLSN uint64, previous [32]byte
 	defer func() {
 		if cleanup {
 			_ = file.Close()
-			_ = os.Remove(temporary)
+			_ = journal.remove(temporary)
 		}
 	}()
 	header := encodeSegmentHeader(segmentHeader{StoreID: journal.storeID, ID: id, FirstLSN: firstLSN, Previous: previous})
@@ -686,15 +1033,14 @@ func (journal *FileJournal) createSegment(id, firstLSN uint64, previous [32]byte
 			return err
 		}
 	}
-	if err := os.Rename(temporary, path); err != nil {
+	if err := journal.rename(temporary, path); err != nil {
 		return err
 	}
 	cleanup = false
 	if err := journal.syncDirectoryLocked(journal.walDir); err != nil {
 		return err
 	}
-	// #nosec G304 -- path is the generated segment path beneath the fixed WAL directory.
-	file, err = os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0o600)
+	file, err = journal.openFile(path, os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -814,7 +1160,7 @@ func snapshotName(generation, throughLSN uint64) string {
 }
 
 func (journal *FileJournal) segmentPaths() ([]string, error) {
-	entries, err := os.ReadDir(journal.walDir)
+	entries, err := journal.readDir(journal.walDir)
 	if err != nil {
 		return nil, fmt.Errorf("read WAL directory: %w", err)
 	}
@@ -830,7 +1176,15 @@ func (journal *FileJournal) segmentPaths() ([]string, error) {
 		if _, err := strconv.ParseUint(name, 10, 64); err != nil {
 			return nil, &CorruptionError{Path: filepath.Join(journal.walDir, entry.Name()), Reason: "invalid segment filename"}
 		}
-		paths = append(paths, filepath.Join(journal.walDir, entry.Name()))
+		entryPath := filepath.Join(journal.walDir, entry.Name())
+		info, err := journal.lstat(entryPath)
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, &CorruptionError{Path: entryPath, Reason: "WAL entry is not a regular file"}
+		}
+		paths = append(paths, entryPath)
 	}
 	sort.Strings(paths)
 	return paths, nil

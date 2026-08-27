@@ -20,6 +20,11 @@ type snapshotCandidate struct {
 	snapshot Snapshot
 }
 
+type invalidSnapshot struct {
+	path string
+	err  error
+}
+
 func trimStaleSegmentPrefix(paths []string, floor uint64) []string {
 	first := 0
 	for first < len(paths) {
@@ -50,7 +55,7 @@ func (journal *FileJournal) reconcileInterruptedSegmentPublication(paths []strin
 		return paths, nil
 	}
 	quarantineDir := filepath.Join(journal.dir, "quarantine")
-	if err := os.MkdirAll(quarantineDir, 0o700); err != nil {
+	if err := journal.ensureDirectory(quarantineDir, 0o700); err != nil {
 		return nil, err
 	}
 	if err := journal.syncDirectoryLocked(journal.dir); err != nil {
@@ -58,12 +63,12 @@ func (journal *FileJournal) reconcileInterruptedSegmentPublication(paths []strin
 	}
 	for _, path := range paths[firstExtra:] {
 		destination := filepath.Join(quarantineDir, filepath.Base(path)+".uncommitted")
-		if _, err := os.Stat(destination); err == nil {
+		if _, err := journal.lstat(destination); err == nil {
 			return nil, &CorruptionError{Path: destination, Reason: "uncommitted segment quarantine destination already exists"}
 		} else if !os.IsNotExist(err) {
 			return nil, err
 		}
-		if err := os.Rename(path, destination); err != nil {
+		if err := journal.rename(path, destination); err != nil {
 			return nil, err
 		}
 	}
@@ -101,8 +106,7 @@ func (journal *FileJournal) recoverSegments(paths []string, snapshots []snapshot
 	expectedLSN := head.SnapshotThroughLSN + 1
 	snapshotThroughLSN := head.SnapshotThroughLSN
 	for index, path := range paths {
-		// #nosec G304 -- path comes from segmentPaths after strict 20-digit WAL filename validation.
-		contents, err := os.ReadFile(path)
+		contents, err := journal.readFile(path)
 		if err != nil {
 			return nil, nil, storeID, fmt.Errorf("read WAL segment %s: %w", path, err)
 		}
@@ -251,18 +255,16 @@ func containsValidRecord(encoded []byte, baseOffset int64) bool {
 func (journal *FileJournal) repairTail(path string, offset int64, suffix []byte) error {
 	if len(suffix) > 0 {
 		quarantineDir := filepath.Join(journal.dir, "quarantine")
-		if err := os.MkdirAll(quarantineDir, 0o700); err != nil {
+		if err := journal.ensureDirectory(quarantineDir, 0o700); err != nil {
 			return err
 		}
 		if err := journal.syncDirectoryLocked(journal.dir); err != nil {
 			return err
 		}
 		quarantinePath := filepath.Join(quarantineDir, fmt.Sprintf("%s-%d.bad", filepath.Base(path), offset))
-		// #nosec G304,G703 -- quarantinePath is beneath the locked store and contains only filepath.Base of a validated WAL path.
-		file, err := os.OpenFile(quarantinePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		file, err := journal.openFile(quarantinePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if os.IsExist(err) {
-			// #nosec G304,G703 -- same fixed quarantine path checked above; read verifies existing crash evidence.
-			existing, readErr := os.ReadFile(quarantinePath)
+			existing, readErr := journal.readFile(quarantinePath)
 			if readErr != nil {
 				return readErr
 			}
@@ -297,8 +299,7 @@ func (journal *FileJournal) repairTail(path string, offset int64, suffix []byte)
 			return err
 		}
 	}
-	// #nosec G304 -- path is an active WAL path produced by validated segment enumeration.
-	file, err := os.OpenFile(path, os.O_RDWR, 0o600)
+	file, err := journal.openFile(path, os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
@@ -368,27 +369,33 @@ func decodeSnapshot(path string, encoded []byte) ([16]byte, Snapshot, error) {
 	return storeID, Snapshot{Generation: generation, ThroughLSN: throughLSN, Payload: bytes.Clone(encoded[snapshotHeaderSize:trailer])}, nil
 }
 
-func (journal *FileJournal) loadSnapshots() ([]snapshotCandidate, error) {
-	entries, err := os.ReadDir(journal.snapshotDir)
+func (journal *FileJournal) loadSnapshots() ([]snapshotCandidate, []invalidSnapshot, error) {
+	entries, err := journal.readDir(journal.snapshotDir)
 	if err != nil {
-		return nil, fmt.Errorf("read snapshot directory: %w", err)
+		return nil, nil, fmt.Errorf("read snapshot directory: %w", err)
 	}
 	candidates := make([]snapshotCandidate, 0)
-	invalid := make([]error, 0)
+	invalid := make([]invalidSnapshot, 0)
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".snap") {
 			continue
 		}
 		path := filepath.Join(journal.snapshotDir, entry.Name())
-		// #nosec G304 -- path is formed from a snapshotDir entry constrained to the .snap format.
-		contents, readErr := os.ReadFile(path)
+		info, statErr := journal.lstat(path)
+		if statErr != nil {
+			return nil, nil, statErr
+		}
+		if !info.Mode().IsRegular() {
+			return nil, nil, &CorruptionError{Path: path, Reason: "snapshot entry is not a regular file"}
+		}
+		contents, readErr := journal.readFile(path)
 		if readErr != nil {
-			invalid = append(invalid, readErr)
+			invalid = append(invalid, invalidSnapshot{path: path, err: readErr})
 			continue
 		}
 		storeID, snapshot, decodeErr := decodeSnapshot(path, contents)
 		if decodeErr != nil {
-			invalid = append(invalid, decodeErr)
+			invalid = append(invalid, invalidSnapshot{path: path, err: decodeErr})
 			continue
 		}
 		candidates = append(candidates, snapshotCandidate{path: path, storeID: storeID, snapshot: snapshot})
@@ -396,10 +403,7 @@ func (journal *FileJournal) loadSnapshots() ([]snapshotCandidate, error) {
 	sort.Slice(candidates, func(left, right int) bool {
 		return candidates[left].snapshot.Generation > candidates[right].snapshot.Generation
 	})
-	if len(candidates) == 0 && len(invalid) > 0 {
-		return nil, errors.Join(invalid...)
-	}
-	return candidates, nil
+	return candidates, invalid, nil
 }
 
 func (journal *FileJournal) compactLocked() error {
@@ -407,9 +411,12 @@ func (journal *FileJournal) compactLocked() error {
 	if err != nil {
 		return err
 	}
-	snapshots, err := journal.loadSnapshots()
+	snapshots, invalid, err := journal.loadSnapshots()
 	if err != nil {
 		return err
+	}
+	if len(invalid) != 0 {
+		return errors.New("invalid snapshots appeared after startup")
 	}
 	cutoff := uint64(0)
 	if len(snapshots) >= 2 {
@@ -421,8 +428,7 @@ func (journal *FileJournal) compactLocked() error {
 		if path == journal.activePath {
 			continue
 		}
-		// #nosec G304 -- path comes from segmentPaths after strict 20-digit WAL filename validation.
-		contents, err := os.ReadFile(path)
+		contents, err := journal.readFile(path)
 		if err != nil {
 			return err
 		}
@@ -454,7 +460,7 @@ func (journal *FileJournal) compactLocked() error {
 		}
 	}
 	for _, path := range removable {
-		info, err := os.Stat(path)
+		info, err := journal.lstat(path)
 		if err != nil {
 			return err
 		}
@@ -463,7 +469,7 @@ func (journal *FileJournal) compactLocked() error {
 				return err
 			}
 		}
-		if err := os.Remove(path); err != nil {
+		if err := journal.remove(path); err != nil {
 			return err
 		}
 		journal.walBytes -= info.Size()
@@ -476,9 +482,12 @@ func (journal *FileJournal) compactLocked() error {
 }
 
 func (journal *FileJournal) pruneSnapshotsLocked() error {
-	valid, err := journal.loadSnapshots()
+	valid, invalid, err := journal.loadSnapshots()
 	if err != nil {
 		return err
+	}
+	if len(invalid) != 0 {
+		return errors.New("invalid snapshots appeared after startup")
 	}
 	if len(valid) <= 2 {
 		return journal.syncDirectoryLocked(journal.snapshotDir)
@@ -489,7 +498,7 @@ func (journal *FileJournal) pruneSnapshotsLocked() error {
 				return err
 			}
 		}
-		if err := os.Remove(snapshot.path); err != nil {
+		if err := journal.remove(snapshot.path); err != nil {
 			return err
 		}
 	}

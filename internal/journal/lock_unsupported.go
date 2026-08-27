@@ -5,6 +5,7 @@ package journal
 import (
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 )
 
@@ -12,7 +13,8 @@ var errLockUnsupported = errors.New("journal process locking is unsupported on t
 
 type directoryLock struct{}
 
-func acquireDirectoryLock(string) (*directoryLock, error) {
+func acquireDirectoryLock(file *os.File) (*directoryLock, error) {
+	_ = file.Close()
 	return nil, fmt.Errorf("%w: %s", errLockUnsupported, runtime.GOOS)
 }
 

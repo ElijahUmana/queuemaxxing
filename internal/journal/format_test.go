@@ -188,7 +188,7 @@ func TestJournalLifecycleStatsAndInvalidDiskEntries(t *testing.T) {
 
 func TestHeadAndSnapshotDiskFailures(t *testing.T) {
 	dir := t.TempDir()
-	instance := &FileJournal{dir: dir, snapshotDir: filepath.Join(dir, "snapshots")}
+	instance := newRootedTestJournal(t, dir)
 	if _, _, err := instance.loadHead(); err != nil {
 		t.Fatal(err)
 	}
@@ -205,8 +205,8 @@ func TestHeadAndSnapshotDiskFailures(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(instance.snapshotDir, "snapshot-00000000000000000001-00000000000000000001.snap"), []byte("bad"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := instance.loadSnapshots(); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("snapshot error = %v", err)
+	if _, invalid, err := instance.loadSnapshots(); err != nil || len(invalid) != 1 || !errors.Is(invalid[0].err, ErrCorrupt) {
+		t.Fatalf("snapshot invalid = %+v, error = %v", invalid, err)
 	}
 }
 
