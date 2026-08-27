@@ -194,6 +194,41 @@ func TestDuplicateContentTypeHeaders(t *testing.T) {
 	}
 }
 
+func TestCompactRequiresJSON(t *testing.T) {
+	baseURL := strings.TrimSuffix(os.Getenv("QMAX_TEST_URL"), "/")
+	if baseURL == "" {
+		t.Skip("QMAX_TEST_URL is not set; run against a real qmax process")
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	for _, test := range []struct {
+		body, contentType string
+		status            int
+	}{
+		{status: http.StatusUnsupportedMediaType},
+		{contentType: "application/json", status: http.StatusBadRequest},
+		{body: `{}`, contentType: "text/plain", status: http.StatusUnsupportedMediaType},
+		{body: `x=y`, contentType: "application/x-www-form-urlencoded", status: http.StatusUnsupportedMediaType},
+		{body: `{}`, contentType: "application/json", status: http.StatusOK},
+	} {
+		request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, baseURL+"/v1/admin/compact", strings.NewReader(test.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if test.contentType != "" {
+			request.Header.Set("Content-Type", test.contentType)
+		}
+		request.Header.Set("Origin", "https://hostile.example")
+		result, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := readResponse(t, result)
+		if response.StatusCode != test.status || response.Header.Get("Access-Control-Allow-Origin") != "" {
+			t.Fatalf("contentType=%q status=%d ACAO=%q body=%s", test.contentType, response.StatusCode, response.Header.Get("Access-Control-Allow-Origin"), response.Body)
+		}
+	}
+}
+
 func TestMalformedQueries(t *testing.T) {
 	baseURL := strings.TrimSuffix(os.Getenv("QMAX_TEST_URL"), "/")
 	if baseURL == "" {

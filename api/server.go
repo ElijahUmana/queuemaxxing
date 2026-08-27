@@ -638,12 +638,6 @@ func (server *Server) decode(response http.ResponseWriter, request *http.Request
 }
 
 func (server *Server) decodeEmpty(response http.ResponseWriter, request *http.Request) bool {
-	if !server.rejectQuery(response, request, nil) {
-		return false
-	}
-	if request.Body == nil || request.ContentLength == 0 {
-		return true
-	}
 	var body struct{}
 	return server.decode(response, request, &body)
 }

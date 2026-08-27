@@ -71,6 +71,33 @@ func TestHandlerProxiesOnlyAPIPath(t *testing.T) {
 	}
 }
 
+func TestWorkbenchProxyDoesNotBypassCompactJSONRequirement(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/v1/admin/compact" {
+			t.Fatalf("path = %q", request.URL.Path)
+		}
+		if request.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
+			t.Fatalf("content type = %q", request.Header.Get("Content-Type"))
+		}
+		response.Header().Set("Content-Type", "application/problem+json")
+		response.WriteHeader(http.StatusUnsupportedMediaType)
+		_, _ = response.Write([]byte(`{"code":"unsupported_media_type"}`))
+	}))
+	defer upstream.Close()
+	handler, err := newHandler(upstream.URL, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/admin/compact", strings.NewReader("x=y"))
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	request.Header.Set("Origin", "https://hostile.example")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnsupportedMediaType || response.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("status=%d ACAO=%q body=%s", response.Code, response.Header().Get("Access-Control-Allow-Origin"), response.Body.String())
+	}
+}
+
 func TestHandlerRejectsInvalidUpstream(t *testing.T) {
 	_, err := newHandler("file:///tmp/socket", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err == nil {

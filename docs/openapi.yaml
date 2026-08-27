@@ -198,7 +198,7 @@ paths:
     post:
       operationId: compact
       requestBody:
-        required: false
+        required: true
         content: {application/json: {schema: {type: object, additionalProperties: false}}}
       responses:
         '200': {description: Compaction completed, content: {application/json: {schema: {$ref: '#/components/schemas/Status'}}}}

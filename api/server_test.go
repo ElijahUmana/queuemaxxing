@@ -807,6 +807,52 @@ func TestServiceErrorLogRedactsPathsAndDetails(t *testing.T) {
 	}
 }
 
+func TestCompactRequiresExplicitJSONObject(t *testing.T) {
+	called := 0
+	server := newTestServer(t, &fakeService{compact: func(context.Context) error {
+		called++
+		return nil
+	}}, Options{})
+	tests := []struct {
+		name, body, contentType string
+		status                  int
+	}{
+		{name: "no body or content type", status: http.StatusUnsupportedMediaType},
+		{name: "empty JSON", contentType: "application/json", status: http.StatusBadRequest},
+		{name: "plain text", body: `{}`, contentType: "text/plain", status: http.StatusUnsupportedMediaType},
+		{name: "form", body: `x=y`, contentType: "application/x-www-form-urlencoded", status: http.StatusUnsupportedMediaType},
+		{name: "valid object", body: `{}`, contentType: "application/json", status: http.StatusOK},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "/v1/admin/compact", strings.NewReader(test.body))
+			if test.contentType != "" {
+				request.Header.Set("Content-Type", test.contentType)
+			}
+			request.Header.Set("Origin", "https://hostile.example")
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+			if response.Code != test.status {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+			if response.Header().Get("Access-Control-Allow-Origin") != "" {
+				t.Fatalf("permissive CORS header = %q", response.Header().Get("Access-Control-Allow-Origin"))
+			}
+		})
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/admin/compact", strings.NewReader(`{}`))
+	request.Header.Add("Content-Type", "application/json")
+	request.Header.Add("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("duplicate Content-Type status = %d", response.Code)
+	}
+	if called != 1 {
+		t.Fatalf("compact calls = %d, want 1", called)
+	}
+}
+
 func TestServiceProblemContextAndCompactionConflict(t *testing.T) {
 	server := newTestServer(t, &fakeService{enqueue: func(context.Context, string, model.EnqueueRequest) (model.Message, bool, error) {
 		return model.Message{}, false, context.DeadlineExceeded
