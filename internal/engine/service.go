@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	queueclock "github.com/ElijahUmana/queuemaxxing/internal/clock"
 	"github.com/ElijahUmana/queuemaxxing/internal/journal"
@@ -337,9 +338,6 @@ func (s *service) validateRecoveredState() error {
 	if s.state.Idempotency == nil {
 		s.state.Idempotency = make(map[string]idempotencyRecord)
 	}
-	if s.state.NextSequence == 0 {
-		s.state.NextSequence = 1
-	}
 	if s.inFlightByQueue == nil {
 		s.inFlightByQueue = make(map[string]int)
 	} else {
@@ -500,7 +498,7 @@ func validatePersistedState(state persistedState, throughLSN uint64) error {
 			if id == "" || message.ID != id || message.Queue != name {
 				return fmt.Errorf("queue %q message map key %q has inconsistent identity", name, id)
 			}
-			if !json.Valid(message.Payload) || message.Sequence == 0 || message.Sequence >= state.NextSequence || message.EnqueuedAt.IsZero() || message.AvailableAt.IsZero() {
+			if !json.Valid(message.Payload) || !utf8.Valid(message.Payload) || message.Sequence == 0 || message.Sequence >= state.NextSequence || message.EnqueuedAt.IsZero() || message.AvailableAt.IsZero() {
 				return fmt.Errorf("queue %q message %q has invalid immutable fields", name, id)
 			}
 			if other, exists := sequences[message.Sequence]; exists {
