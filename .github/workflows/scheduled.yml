@@ -32,7 +32,20 @@ jobs:
 
   race-stress:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: engine
+            package: ./internal/engine
+            regex: ^Test(ConcurrentReceiveHasSingleLeasePerMessage|ConcurrentEnqueueSequencesAreUnique|LongPollWakesOnEnqueue|ReceiveLongPollCancellationReleasesWaiter|CloseWakesLongPollAndReleasesWaiter|MutationCoordinatorBatchesConcurrentEnqueuesInOrder|MutationCoordinatorInvalidNeighborAndBatchFailureIsolation|MutationCoordinatorCancellationAndCloseDrain|MutationCoordinatorRealJournalCoalescesAndRecovers|MutationCoordinatorSpeculativeReplayWaitsForDurability|MutationCoordinatorReplaySurvivesNeighborPersistenceFailure|MutationCoordinatorAdmissionFailsFastWhenSaturated|MutationCoordinatorFreezesQueuedRequestInputs|MutationCoordinatorClosingVisibilityAndFinalization|MutationCoordinatorSerializesCompactionWithBlockedBatch|MutationCoordinatorPostInclusionCancellationCommits|MutationCoordinatorBoundsBatchSize)$
+          - name: journal
+            package: ./internal/journal
+            regex: ^Test(GroupCommitSharesDurabilityBoundary|GroupCommitSyncFailureRejectsWholeBatch|ConcurrentAppendProducesContiguousDurableLSNs|ConcurrentCloseReturnsSameErrorAndReleasesStorage|CloseDrainsAcceptedAppendsAndRejectsNewOnes|ConcurrentOversizedBatchesAreRejectedWithoutMutation)$
+          - name: integration
+            package: ./internal/integration
+            regex: ^Test(EngineMatchesReferenceOrderingAndRestart|EngineRestartPreservesDelayedAndAckedState|NewestWALTornTailRecoveryAtEveryOffset|TruncatingBelowDurableHeadRefusesStartup|WALCorruptionRefusesStartup)$
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -40,16 +53,20 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: go install golang.org/x/tools/cmd/stress@latest
-      - name: Compile race integration tests
-        run: mkdir -p artifacts && go test -race -c -o artifacts/integration-race.test ./internal/integration
-      - name: Run finite race stress
+      - name: Compile race ${{ matrix.name }} tests
+        run: mkdir -p artifacts && go test -race -c -o "artifacts/${{ matrix.name }}-race.test" "${{ matrix.package }}"
+      - name: Run finite ${{ matrix.name }} race stress
         shell: bash
+        env:
+          TEST_REGEX: ${{ matrix.regex }}
         run: |
           set -u
           set +e
           timeout --signal=TERM --kill-after=15s 30m \
-            stress -failfast -p 8 -timeout 5m -o artifacts/race-stress-failure- artifacts/integration-race.test \
-            2>&1 | tee artifacts/race-stress.log
+            stress -failfast -p 8 -timeout 5m -o "artifacts/race-stress-${{ matrix.name }}-failure-" \
+            "$GITHUB_WORKSPACE/artifacts/${{ matrix.name }}-race.test" \
+            -test.run "$TEST_REGEX" \
+            2>&1 | tee "artifacts/race-stress-${{ matrix.name }}.log"
           pipeline_status=("${PIPESTATUS[@]}")
           set -e
           stress_status=${pipeline_status[0]}
@@ -66,11 +83,11 @@ jobs:
             exit "$stress_status"
           fi
           printf 'race stress completed the bounded 30-minute window\n'
-      - name: Upload race evidence
+      - name: Upload ${{ matrix.name }} race evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: race-stress-${{ github.run_attempt }}
+          name: race-stress-${{ matrix.name }}-${{ github.run_attempt }}
           path: artifacts/
           if-no-files-found: ignore
 
