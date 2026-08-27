@@ -972,12 +972,7 @@ func (journal *FileJournal) syncDirectoryLocked(path string) error {
 			return err
 		}
 	}
-	directory, err := journal.openFile(path, os.O_RDONLY, 0)
-	if err != nil {
-		return err
-	}
-	defer directory.Close()
-	return directory.Sync()
+	return syncDirectory(path)
 }
 
 func (journal *FileJournal) rotateLocked() error {
