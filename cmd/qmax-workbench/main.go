@@ -130,9 +130,9 @@ type proxyProblem struct {
 }
 
 func proxyRequestID(request *http.Request) string {
-	requestID := request.Header.Get("X-Request-ID")
-	if validRequestID(requestID) {
-		return requestID
+	requestIDs := request.Header.Values("X-Request-ID")
+	if len(requestIDs) == 1 && validRequestID(requestIDs[0]) {
+		return requestIDs[0]
 	}
 	var value [16]byte
 	if _, err := rand.Read(value[:]); err == nil {

@@ -216,6 +216,25 @@ func TestProxyFailureReplacesInvalidRequestID(t *testing.T) {
 	}
 }
 
+func TestProxyFailureReplacesDuplicateRequestIDs(t *testing.T) {
+	handler, err := newHandler("http://127.0.0.1:1", slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/queues", nil)
+	request.Header.Add("X-Request-ID", "first-request-id")
+	request.Header.Add("X-Request-ID", "second-request-id")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	var problem proxyProblem
+	if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil {
+		t.Fatal(err)
+	}
+	if problem.RequestID == "" || problem.RequestID == "first-request-id" || problem.RequestID == "second-request-id" || response.Header().Get("X-Request-ID") != problem.RequestID {
+		t.Fatalf("header=%q body=%q", response.Header().Get("X-Request-ID"), problem.RequestID)
+	}
+}
+
 func TestWorkbenchStaticAndRouteErrors(t *testing.T) {
 	handler, err := newHandler("http://127.0.0.1:1", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
