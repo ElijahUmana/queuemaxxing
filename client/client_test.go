@@ -87,7 +87,7 @@ func TestClientRealQueueLifecycle(t *testing.T) {
 	enqueued, err := client.Enqueue(ctx, "jobs", api.EnqueueRequest{
 		Payload: json.RawMessage(`{"task":"render"}`), Priority: &priority, DelayMS: &delay,
 	}, "enqueue-render")
-	if err != nil || enqueued.Data.ID == "" || enqueued.Data.LastLSN == 0 {
+	if err != nil || enqueued.Data.ID == "" || enqueued.Data.Sequence == 0 {
 		t.Fatalf("enqueue = %+v, %v", enqueued, err)
 	}
 	received, err := client.ReceiveIdempotent(ctx, "jobs", api.ReceiveRequest{VisibilityTimeoutMS: int64Pointer(30_000)}, "receive-render")

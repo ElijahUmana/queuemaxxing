@@ -79,8 +79,11 @@ func TestPublicAPIContract(t *testing.T) {
 	if len(delivery.Messages) != 1 || delivery.Messages[0].Message.ID == "" || delivery.Messages[0].ReceiptHandle == "" {
 		t.Fatalf("invalid receive response: %s", receive.Body)
 	}
-	if delivery.Messages[0].Message.Sequence == 0 || delivery.Messages[0].Message.LastLSN == 0 {
-		t.Fatalf("sequence and last_lsn must be populated: %s", receive.Body)
+	if delivery.Messages[0].Message.Sequence == 0 {
+		t.Fatalf("sequence must be populated: %s", receive.Body)
+	}
+	if bytes.Contains(receive.Body, []byte(`"last_lsn"`)) {
+		t.Fatalf("receive response exposed per-message last_lsn: %s", receive.Body)
 	}
 
 	messageID := delivery.Messages[0].Message.ID
@@ -106,18 +109,20 @@ func TestMalformedRequests(t *testing.T) {
 	cases := []struct {
 		name        string
 		contentType string
-		body        string
+		body        []byte
 		wantCode    string
 	}{
-		{name: "wrong content type", contentType: "text/plain", body: `{}`, wantCode: "unsupported_media_type"},
-		{name: "unknown field", contentType: "application/json", body: `{"name":"x","ordering":"fifo","priority_enabled":false,"default_delay_ms":0,"default_visibility_timeout_ms":1,"max_deliveries":1,"unknown":true}`, wantCode: "invalid_json"},
-		{name: "trailing JSON", contentType: "application/json", body: `{} {}`, wantCode: "invalid_json"},
-		{name: "duplicate key", contentType: "application/json", body: `{"name":"a","name":"b"}`, wantCode: "invalid_json"},
-		{name: "null", contentType: "application/json", body: `null`, wantCode: "invalid_json"},
+		{name: "wrong content type", contentType: "text/plain", body: []byte(`{}`), wantCode: "unsupported_media_type"},
+		{name: "unknown field", contentType: "application/json", body: []byte(`{"name":"x","ordering":"fifo","priority_enabled":false,"default_delay_ms":0,"default_visibility_timeout_ms":1,"max_deliveries":1,"unknown":true}`), wantCode: "invalid_json"},
+		{name: "trailing JSON", contentType: "application/json", body: []byte(`{} {}`), wantCode: "invalid_json"},
+		{name: "duplicate key", contentType: "application/json", body: []byte(`{"name":"a","name":"b"}`), wantCode: "invalid_json"},
+		{name: "null", contentType: "application/json", body: []byte(`null`), wantCode: "invalid_json"},
+		{name: "invalid UTF-8", contentType: "application/json", body: []byte{'{', '"', 'n', 'a', 'm', 'e', '"', ':', '"', 0xff, '"', '}'}, wantCode: "invalid_json"},
+		{name: "unpaired surrogate", contentType: "application/json", body: []byte(`{"name":"\uD800"}`), wantCode: "invalid_json"},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, baseURL+"/v1/queues", strings.NewReader(testCase.body))
+			request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, baseURL+"/v1/queues", bytes.NewReader(testCase.body))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -132,6 +137,84 @@ func TestMalformedRequests(t *testing.T) {
 			}
 			assertProblem(t, result, testCase.wantCode)
 		})
+	}
+}
+
+func TestOptionalZeroDefaults(t *testing.T) {
+	baseURL := strings.TrimSuffix(os.Getenv("QMAX_TEST_URL"), "/")
+	if baseURL == "" {
+		t.Skip("QMAX_TEST_URL is not set; run against a real qmax process")
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	queueName := fmt.Sprintf("defaults-%d", time.Now().UnixNano())
+	body := fmt.Sprintf(`{"name":%q,"ordering":"fifo","default_visibility_timeout_ms":30000,"max_deliveries":2}`, queueName)
+	created := requestJSON(t, client, http.MethodPost, baseURL+"/v1/queues", body, nil)
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("create status = %d, body = %s", created.StatusCode, created.Body)
+	}
+	enqueued := requestJSON(t, client, http.MethodPost, baseURL+"/v1/queues/"+queueName+"/messages", `{"payload":{}}`, nil)
+	if enqueued.StatusCode != http.StatusCreated {
+		t.Fatalf("enqueue status = %d, body = %s", enqueued.StatusCode, enqueued.Body)
+	}
+	received := requestJSON(t, client, http.MethodPost, baseURL+"/v1/queues/"+queueName+"/messages:receive", `{}`, nil)
+	if received.StatusCode != http.StatusOK {
+		t.Fatalf("receive status = %d, body = %s", received.StatusCode, received.Body)
+	}
+	var delivery queueapi.ReceiveResponse
+	decodeStrict(t, received.Body, &delivery)
+	nacked := requestJSON(t, client, http.MethodPost, baseURL+"/v1/queues/"+queueName+"/messages/"+delivery.Messages[0].Message.ID+"/nack", fmt.Sprintf(`{"receipt_handle":%q}`, delivery.Messages[0].ReceiptHandle), nil)
+	if nacked.StatusCode != http.StatusOK {
+		t.Fatalf("nack status = %d, body = %s", nacked.StatusCode, nacked.Body)
+	}
+}
+
+func TestDuplicateContentTypeHeaders(t *testing.T) {
+	baseURL := strings.TrimSuffix(os.Getenv("QMAX_TEST_URL"), "/")
+	if baseURL == "" {
+		t.Skip("QMAX_TEST_URL is not set; run against a real qmax process")
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	for _, values := range [][]string{{"application/json", "application/json"}, {"application/json", "text/plain"}} {
+		request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, baseURL+"/v1/queues", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, value := range values {
+			request.Header.Add("Content-Type", value)
+		}
+		result, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := readResponse(t, result)
+		if response.StatusCode != http.StatusUnsupportedMediaType {
+			t.Fatalf("headers %q status = %d, body = %s", values, response.StatusCode, response.Body)
+		}
+		assertProblem(t, response, "unsupported_media_type")
+	}
+}
+
+func TestMalformedQueries(t *testing.T) {
+	baseURL := strings.TrimSuffix(os.Getenv("QMAX_TEST_URL"), "/")
+	if baseURL == "" {
+		t.Skip("QMAX_TEST_URL is not set; run against a real qmax process")
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	for _, rawQuery := range []string{"%", "%ZZ", "limit=1;state=ready", "limit=1&limit=2", "limit=", "cursor=", "state="} {
+		request, err := http.NewRequestWithContext(context.Background(), http.MethodGet, baseURL+"/v1/queues/query-test/messages", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.URL.RawQuery = rawQuery
+		result, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := readResponse(t, result)
+		if response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("query %q status = %d, body = %s", rawQuery, response.StatusCode, response.Body)
+		}
+		assertProblem(t, response, "invalid_query")
 	}
 }
 

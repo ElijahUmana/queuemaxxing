@@ -127,10 +127,22 @@ func newTestServer(t *testing.T, service engine.Service, options Options) *Serve
 }
 
 func perform(server http.Handler, method, target, body, contentType string) *httptest.ResponseRecorder {
-	request := httptest.NewRequest(method, target, strings.NewReader(body))
+	return performBytes(server, method, target, []byte(body), contentType)
+}
+
+func performBytes(server http.Handler, method, target string, body []byte, contentType string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, target, bytes.NewReader(body))
 	if contentType != "" {
 		request.Header.Set("Content-Type", contentType)
 	}
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	return response
+}
+
+func performRawQuery(server http.Handler, method, target, rawQuery string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(method, target, nil)
+	request.URL.RawQuery = rawQuery
 	response := httptest.NewRecorder()
 	server.ServeHTTP(response, request)
 	return response
@@ -194,6 +206,66 @@ func TestStrictJSONRejectsUnknownDuplicateTrailingAndNonObject(t *testing.T) {
 	}
 }
 
+func TestStrictJSONRejectsMalformedUnicodeBeforeServiceCall(t *testing.T) {
+	called := false
+	service := &fakeService{enqueue: func(context.Context, string, model.EnqueueRequest) (model.Message, bool, error) {
+		called = true
+		return model.Message{}, false, nil
+	}}
+	server := newTestServer(t, service, Options{})
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "invalid UTF-8 string", body: []byte{'{', '"', 'p', 'a', 'y', 'l', 'o', 'a', 'd', '"', ':', '"', 0xff, '"', '}'}},
+		{name: "invalid UTF-8 nested key", body: []byte{'{', '"', 'p', 'a', 'y', 'l', 'o', 'a', 'd', '"', ':', '{', '"', 0xff, '"', ':', '1', '}', '}'}},
+		{name: "lone high surrogate", body: []byte(`{"payload":{"value":"\uD800"}}`)},
+		{name: "lone low surrogate", body: []byte(`{"payload":{"value":"\uDC00"}}`)},
+		{name: "reversed surrogate pair", body: []byte(`{"payload":{"value":"\uDC00\uD800"}}`)},
+		{name: "high surrogate followed by scalar", body: []byte(`{"payload":{"value":"\uD800\u0041"}}`)},
+		{name: "surrogate in nested key", body: []byte(`{"payload":{"\uD800":1}}`)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			response := performBytes(server, http.MethodPost, "/v1/queues/q/messages", test.body, "application/json")
+			if response.Code != http.StatusBadRequest || decodeProblem(t, response).Code != "invalid_json" {
+				t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+			}
+		})
+	}
+	if called {
+		t.Fatal("service called for malformed Unicode")
+	}
+
+	response := perform(server, http.MethodPost, "/v1/queues/q/messages", `{"payload":{"value":"\uD83D\uDE00","replacement":"�"}}`, "application/json")
+	if response.Code != http.StatusCreated || !called {
+		t.Fatalf("valid Unicode status = %d, called = %t, body = %s", response.Code, called, response.Body.String())
+	}
+}
+
+func TestRequestRejectsDuplicateContentTypeHeaders(t *testing.T) {
+	called := false
+	service := &fakeService{createQueue: func(context.Context, model.QueueConfig, string) (model.QueueInfo, bool, error) {
+		called = true
+		return model.QueueInfo{}, false, nil
+	}}
+	server := newTestServer(t, service, Options{})
+	for _, values := range [][]string{{"application/json", "application/json"}, {"application/json", "text/plain"}} {
+		request := httptest.NewRequest(http.MethodPost, "/v1/queues", strings.NewReader(`{}`))
+		for _, value := range values {
+			request.Header.Add("Content-Type", value)
+		}
+		response := httptest.NewRecorder()
+		server.ServeHTTP(response, request)
+		if response.Code != http.StatusUnsupportedMediaType || decodeProblem(t, response).Code != "unsupported_media_type" {
+			t.Fatalf("values %q = %d %s", values, response.Code, response.Body.String())
+		}
+	}
+	if called {
+		t.Fatal("service called for duplicate Content-Type")
+	}
+}
+
 func TestRequestContentTypeAndSizeAreEnforced(t *testing.T) {
 	server := newTestServer(t, &fakeService{}, Options{MaxRequestBytes: 32})
 	response := perform(server, http.MethodPost, "/v1/queues", `{}`, "text/plain")
@@ -216,6 +288,34 @@ func TestDurationOverflowIsRejectedBeforeServiceCall(t *testing.T) {
 	response := perform(server, http.MethodPost, "/v1/queues", `{"name":"q","ordering":"fifo","priority_enabled":false,"default_delay_ms":9223372036854775807,"default_visibility_timeout_ms":1,"max_deliveries":1}`, "application/json")
 	if response.Code != http.StatusUnprocessableEntity || called {
 		t.Fatalf("status = %d, called = %t", response.Code, called)
+	}
+}
+
+func TestCreateQueueAcceptsOmittedZeroDefaults(t *testing.T) {
+	service := &fakeService{createQueue: func(_ context.Context, config model.QueueConfig, _ string) (model.QueueInfo, bool, error) {
+		if config.PriorityEnabled || config.DefaultDelay != 0 {
+			t.Fatalf("config = %+v", config)
+		}
+		return model.QueueInfo{Config: config}, false, nil
+	}}
+	server := newTestServer(t, service, Options{})
+	response := perform(server, http.MethodPost, "/v1/queues", `{"name":"defaults","ordering":"fifo","default_visibility_timeout_ms":1,"max_deliveries":1}`, "application/json")
+	if response.Code != http.StatusCreated {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestNackAcceptsOmittedRetryDelay(t *testing.T) {
+	service := &fakeService{nack: func(_ context.Context, _ string, request model.NackRequest) (model.Message, bool, error) {
+		if request.Delay != 0 {
+			t.Fatalf("delay = %s", request.Delay)
+		}
+		return model.Message{ID: request.MessageID, Queue: "q", Payload: json.RawMessage(`{}`), State: model.StateReady}, false, nil
+	}}
+	server := newTestServer(t, service, Options{})
+	response := perform(server, http.MethodPost, "/v1/queues/q/messages/m/nack", `{"receipt_handle":"r"}`, "application/json")
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 }
 
@@ -268,6 +368,38 @@ func TestNackRejectsOversizedReason(t *testing.T) {
 	body := `{"receipt_handle":"receipt","retry_delay_ms":0,"reason":"` + strings.Repeat("x", 513) + `"}`
 	response := perform(server, http.MethodPost, "/v1/queues/q/messages/m/nack", body, "application/json")
 	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestMalformedQueryRejectedBeforeServiceCall(t *testing.T) {
+	called := false
+	service := &fakeService{list: func(context.Context, string, model.ListFilter) (model.MessagePage, error) {
+		called = true
+		return model.MessagePage{}, nil
+	}}
+	server := newTestServer(t, service, Options{})
+	for _, rawQuery := range []string{"%", "%ZZ", "limit=1;state=ready", "limit=1&limit=2", "limit=", "cursor=", "state="} {
+		response := performRawQuery(server, http.MethodGet, "/v1/queues/q/messages", rawQuery)
+		if response.Code != http.StatusBadRequest || response.Header().Get("Content-Type") != "application/problem+json" || decodeProblem(t, response).Code != "invalid_query" {
+			t.Fatalf("query %q = %d %s", rawQuery, response.Code, response.Body.String())
+		}
+	}
+	if called {
+		t.Fatal("service called for malformed query")
+	}
+}
+
+func TestOpaqueCursorPercentEncodingIsPreserved(t *testing.T) {
+	service := &fakeService{list: func(_ context.Context, _ string, filter model.ListFilter) (model.MessagePage, error) {
+		if filter.Cursor != "v2.scope/value+suffix=" {
+			t.Fatalf("cursor = %q", filter.Cursor)
+		}
+		return model.MessagePage{Messages: []model.Message{}, SnapshotLSN: 1}, nil
+	}}
+	server := newTestServer(t, service, Options{})
+	response := performRawQuery(server, http.MethodGet, "/v1/queues/q/messages", "cursor=v2.scope%2Fvalue%2Bsuffix%3D")
+	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
 	}
 }
@@ -441,6 +573,9 @@ func TestRemainingHandlersTranslateSuccess(t *testing.T) {
 		if response.Code != test.status || !strings.Contains(response.Body.String(), test.contains) {
 			t.Fatalf("%s %s = %d %s", test.method, test.target, response.Code, response.Body.String())
 		}
+		if strings.Contains(response.Body.String(), `"last_lsn"`) {
+			t.Fatalf("%s %s exposed per-message last_lsn: %s", test.method, test.target, response.Body.String())
+		}
 	}
 }
 
@@ -501,6 +636,12 @@ func TestServerConstructionParserAndIdempotencyEdges(t *testing.T) {
 	if _, err := New(&fakeService{}, Options{RequestTimeout: -1}); err == nil {
 		t.Fatal("negative timeout accepted")
 	}
+	if _, err := New(&fakeService{}, Options{MaxConcurrentRequests: -1}); err == nil {
+		t.Fatal("negative concurrent request limit accepted")
+	}
+	if _, err := New(&fakeService{}, Options{MaxLongPolls: -1}); err == nil {
+		t.Fatal("negative long-poll limit accepted")
+	}
 
 	server := newTestServer(t, &fakeService{}, Options{})
 	for _, body := range []string{
@@ -533,6 +674,136 @@ func TestServerConstructionParserAndIdempotencyEdges(t *testing.T) {
 	server.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || response.Header().Get("X-Request-ID") == " invalid " {
 		t.Fatalf("request ID response = %+v", response.Header())
+	}
+}
+
+func TestConcurrentRequestLimitRejectsAndRecovers(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	service := &fakeService{listQueues: func(context.Context) ([]model.QueueInfo, error) {
+		started <- struct{}{}
+		<-release
+		return nil, nil
+	}}
+	server := newTestServer(t, service, Options{MaxConcurrentRequests: 1})
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { firstDone <- perform(server, http.MethodGet, "/v1/queues", "", "") }()
+	<-started
+
+	rejected := perform(server, http.MethodGet, "/v1/stats", "", "")
+	if rejected.Code != http.StatusTooManyRequests || rejected.Header().Get("Retry-After") != "1" || decodeProblem(t, rejected).Code != "capacity_exceeded" {
+		t.Fatalf("rejected = %d %+v %s", rejected.Code, rejected.Header(), rejected.Body.String())
+	}
+	if live := perform(server, http.MethodGet, "/health/live", "", ""); live.Code != http.StatusOK {
+		t.Fatalf("liveness = %d %s", live.Code, live.Body.String())
+	}
+	close(release)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first = %d %s", first.Code, first.Body.String())
+	}
+	if recovered := perform(server, http.MethodGet, "/v1/stats", "", ""); recovered.Code != http.StatusOK {
+		t.Fatalf("recovered = %d %s", recovered.Code, recovered.Body.String())
+	}
+}
+
+func TestLongPollLimitRejectsOnlyPositiveWaits(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	service := &fakeService{receive: func(_ context.Context, _ string, request model.ReceiveRequest) (*model.Delivery, bool, error) {
+		if request.WaitTimeout > 0 {
+			started <- struct{}{}
+			<-release
+		}
+		return nil, false, nil
+	}}
+	server := newTestServer(t, service, Options{MaxConcurrentRequests: 3, MaxLongPolls: 1})
+	firstDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		firstDone <- perform(server, http.MethodPost, "/v1/queues/q/messages:receive", `{"wait_timeout_ms":1000}`, "application/json")
+	}()
+	<-started
+
+	rejected := perform(server, http.MethodPost, "/v1/queues/q/messages:receive", `{"wait_timeout_ms":1000}`, "application/json")
+	if rejected.Code != http.StatusTooManyRequests || rejected.Header().Get("Retry-After") != "1" || decodeProblem(t, rejected).Code != "capacity_exceeded" {
+		t.Fatalf("rejected = %d %+v %s", rejected.Code, rejected.Header(), rejected.Body.String())
+	}
+	immediate := perform(server, http.MethodPost, "/v1/queues/q/messages:receive", `{"wait_timeout_ms":0}`, "application/json")
+	if immediate.Code != http.StatusOK {
+		t.Fatalf("immediate = %d %s", immediate.Code, immediate.Body.String())
+	}
+	close(release)
+	if first := <-firstDone; first.Code != http.StatusOK {
+		t.Fatalf("first = %d %s", first.Code, first.Body.String())
+	}
+}
+
+type failingResponseWriter struct {
+	header http.Header
+	error  error
+}
+
+func (writer *failingResponseWriter) Header() http.Header { return writer.header }
+func (*failingResponseWriter) WriteHeader(int)            {}
+func (writer *failingResponseWriter) Write([]byte) (int, error) {
+	return 0, writer.error
+}
+
+func TestResponseWriteFailureLogsBoundedContext(t *testing.T) {
+	const secret = "secret-receipt-idempotency-path"
+	var output bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&output, nil))
+	server, err := New(&fakeService{}, Options{Logger: logger, RequestID: func() string { return "req_write_failure" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/v1/queues/"+secret, nil)
+	writer := &failingResponseWriter{header: make(http.Header), error: errors.New(secret)}
+	server.ServeHTTP(writer, request)
+	logged := output.String()
+	for _, expected := range []string{"req_write_failure", "method=GET", `route="GET /v1/queues/{queue}"`, "status=200", "error_type"} {
+		if !strings.Contains(logged, expected) {
+			t.Fatalf("log missing %q: %s", expected, logged)
+		}
+	}
+	if strings.Contains(logged, secret) || strings.Contains(logged, "/v1/queues/"+secret) {
+		t.Fatalf("log exposed secret: %s", logged)
+	}
+}
+
+func TestServiceStatsRedactInternalStorageReason(t *testing.T) {
+	const path = "/private/storage/secret-sentinel.wal"
+	service := &fakeService{stats: func(context.Context) (model.ServiceStats, error) {
+		return model.ServiceStats{ReadOnly: true, ReadOnlyReason: "rename " + path + ": permission denied"}, nil
+	}}
+	server := newTestServer(t, service, Options{})
+	response := perform(server, http.MethodGet, "/v1/stats", "", "")
+	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), path) || strings.Contains(response.Body.String(), "permission denied") || !strings.Contains(response.Body.String(), `"read_only_reason":"storage operation failed"`) {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestServiceErrorLogRedactsPathsAndDetails(t *testing.T) {
+	var output bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&output, nil))
+	service := &fakeService{getQueue: func(context.Context, string) (model.QueueInfo, error) {
+		return model.QueueInfo{}, errors.New("storage /private/data/queue secret-receipt failed")
+	}}
+	server, err := New(service, Options{Logger: logger, RequestID: func() string { return "req_redacted" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := perform(server, http.MethodGet, "/v1/queues/private-queue-id", "", "")
+	if response.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d %s", response.Code, response.Body.String())
+	}
+	logged := output.String()
+	for _, secret := range []string{"/private/data/queue", "secret-receipt", "private-queue-id", "/v1/queues"} {
+		if strings.Contains(logged, secret) {
+			t.Fatalf("log exposed %q: %s", secret, logged)
+		}
+	}
+	if !strings.Contains(logged, "req_redacted") || !strings.Contains(logged, "internal_error") {
+		t.Fatalf("log missing bounded diagnostics: %s", logged)
 	}
 }
 
