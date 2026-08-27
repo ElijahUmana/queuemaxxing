@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,9 +33,10 @@ const (
 )
 
 type config struct {
-	listenAddress   string
-	dataDirectory   string
-	shutdownTimeout time.Duration
+	listenAddress    string
+	dataDirectory    string
+	shutdownTimeout  time.Duration
+	allowNonLoopback bool
 }
 
 type healthConfig struct {
@@ -80,7 +84,10 @@ func runCLI(ctx context.Context, args []string) error {
 	}
 }
 
-func run(parent context.Context, config config) error {
+func run(parent context.Context, config config) (runError error) {
+	if err := validateListenAddress(config.listenAddress, config.allowNonLoopback); err != nil {
+		return err
+	}
 	store, err := journal.Open(journal.Config{Dir: config.dataDirectory})
 	if err != nil {
 		return fmt.Errorf("open queue journal: %w", err)
@@ -90,10 +97,14 @@ func run(parent context.Context, config config) error {
 		_ = store.Close()
 		return fmt.Errorf("open queue engine: %w", err)
 	}
+	defer func() {
+		if closeErr := service.Close(context.Background()); closeErr != nil {
+			runError = errors.Join(runError, fmt.Errorf("close queue service: %w", closeErr))
+		}
+	}()
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	apiServer, err := api.New(service, api.Options{Logger: logger})
 	if err != nil {
-		_ = service.Close(context.Background())
 		return fmt.Errorf("configure queue API: %w", err)
 	}
 	httpServer := &http.Server{
@@ -106,29 +117,41 @@ func run(parent context.Context, config config) error {
 	defer stop()
 	serveError := make(chan error, 1)
 	go func() {
-		logger.Info("queue API listening", "address", config.listenAddress, "data_directory", config.dataDirectory)
+		logger.Info("queue API listening", "network_scope", networkScope(config.listenAddress))
 		serveError <- httpServer.ListenAndServe()
 	}()
 	select {
 	case err := <-serveError:
 		if !errors.Is(err, http.ErrServerClosed) {
-			_ = service.Close(context.Background())
 			return fmt.Errorf("serve queue API: %w", err)
 		}
 		return nil
 	case <-ctx.Done():
-		apiServer.SetDraining(true)
-		if err := service.Close(context.Background()); err != nil {
-			return fmt.Errorf("close queue service: %w", err)
-		}
-		shutdownContext, cancel := context.WithTimeout(context.Background(), config.shutdownTimeout)
-		defer cancel()
-		if err := httpServer.Shutdown(shutdownContext); err != nil {
-			_ = httpServer.Close()
-			return fmt.Errorf("shut down queue API: %w", err)
-		}
-		return nil
+		return drainHTTP(apiServer, httpServer, config.shutdownTimeout)
 	}
+}
+
+type drainer interface {
+	SetDraining(bool)
+}
+
+type httpShutdowner interface {
+	Shutdown(context.Context) error
+	Close() error
+}
+
+func drainHTTP(apiServer drainer, httpServer httpShutdowner, timeout time.Duration) error {
+	apiServer.SetDraining(true)
+	shutdownContext, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := httpServer.Shutdown(shutdownContext); err != nil {
+		closeErr := httpServer.Close()
+		if closeErr != nil {
+			return errors.Join(fmt.Errorf("shut down queue API: %w", err), fmt.Errorf("close queue API: %w", closeErr))
+		}
+		return fmt.Errorf("shut down queue API: %w", err)
+	}
+	return nil
 }
 
 func healthcheck(ctx context.Context, config healthConfig) error {
@@ -170,6 +193,7 @@ func parseServeConfig(args []string) (config, error) {
 	flags.StringVar(&config.listenAddress, "listen", envOrDefault("QMAX_LISTEN", defaultListenAddress), "HTTP listen address")
 	flags.StringVar(&config.dataDirectory, "data-dir", envOrDefault("QMAX_DATA_DIR", defaultDataDirectory), "durable queue data directory")
 	flags.DurationVar(&config.shutdownTimeout, "shutdown-timeout", defaultShutdownTimeout, "graceful shutdown deadline")
+	flags.BoolVar(&config.allowNonLoopback, "allow-non-loopback", envBool("QMAX_ALLOW_NON_LOOPBACK"), "allow listening beyond loopback when protected by external authentication and TLS")
 	if err := flags.Parse(args); err != nil {
 		return config, err
 	}
@@ -178,6 +202,9 @@ func parseServeConfig(args []string) (config, error) {
 	}
 	if config.listenAddress == "" || config.dataDirectory == "" || config.shutdownTimeout <= 0 {
 		return config, errors.New("listen address, data directory, and positive shutdown timeout are required")
+	}
+	if err := validateListenAddress(config.listenAddress, config.allowNonLoopback); err != nil {
+		return config, err
 	}
 	return config, nil
 }
@@ -200,9 +227,40 @@ func parseHealthConfig(args []string) (healthConfig, error) {
 	return config, nil
 }
 
+func validateListenAddress(address string, allowNonLoopback bool) error {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("invalid listen address: %w", err)
+	}
+	if port == "" {
+		return errors.New("listen address must include a port")
+	}
+	parsed, err := netip.ParseAddr(host)
+	if err != nil {
+		return errors.New("listen address host must be an IP address")
+	}
+	if !parsed.IsLoopback() && !allowNonLoopback {
+		return errors.New("non-loopback listen address requires --allow-non-loopback and external authentication and TLS")
+	}
+	return nil
+}
+
+func networkScope(address string) string {
+	host, _, _ := net.SplitHostPort(address)
+	if parsed, err := netip.ParseAddr(host); err == nil && parsed.IsLoopback() {
+		return "loopback"
+	}
+	return "external"
+}
+
+func envBool(name string) bool {
+	value, err := strconv.ParseBool(os.Getenv(name))
+	return err == nil && value
+}
+
 func printUsage(writer io.Writer) {
 	_, _ = fmt.Fprintln(writer, "Usage:")
-	_, _ = fmt.Fprintln(writer, "  qmax serve [--listen address] [--data-dir path]")
+	_, _ = fmt.Fprintln(writer, "  qmax serve [--listen address] [--data-dir path] [--allow-non-loopback]")
 	_, _ = fmt.Fprintln(writer, "  qmax healthcheck [--url base-url] [--timeout duration]")
 }
 

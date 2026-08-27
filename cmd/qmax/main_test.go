@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +21,37 @@ func TestParseServeConfig(t *testing.T) {
 	}
 	if config.listenAddress != "127.0.0.1:9090" || config.shutdownTimeout != 3*time.Second {
 		t.Fatalf("config = %+v", config)
+	}
+}
+
+func TestParseServeConfigRequiresNonLoopbackOptIn(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:8080", "[::]:8080", "192.0.2.1:8080"} {
+		if _, err := parseServeConfig([]string{"--listen", address, "--data-dir", t.TempDir()}); err == nil {
+			t.Fatalf("accepted non-loopback address %q without opt-in", address)
+		}
+		config, err := parseServeConfig([]string{"--listen", address, "--data-dir", t.TempDir(), "--allow-non-loopback"})
+		if err != nil || !config.allowNonLoopback {
+			t.Fatalf("opted-in address %q = %+v, %v", address, config, err)
+		}
+	}
+	for _, address := range []string{"127.0.0.1:8080", "[::1]:8080"} {
+		if _, err := parseServeConfig([]string{"--listen", address, "--data-dir", t.TempDir()}); err != nil {
+			t.Fatalf("loopback address %q rejected: %v", address, err)
+		}
+	}
+	for _, address := range []string{"127.0.0.1", "localhost", ":", "localhost:8080", "example.com:8080", "LOCALHOST:8080"} {
+		if _, err := parseServeConfig([]string{"--listen", address, "--data-dir", t.TempDir()}); err == nil {
+			t.Fatalf("malformed address %q accepted", address)
+		}
+	}
+}
+
+func TestParseServeConfigNonLoopbackEnvironmentOptIn(t *testing.T) {
+	t.Setenv("QMAX_LISTEN", "0.0.0.0:8080")
+	t.Setenv("QMAX_ALLOW_NON_LOOPBACK", "true")
+	config, err := parseServeConfig(nil)
+	if err != nil || !config.allowNonLoopback {
+		t.Fatalf("config = %+v, %v", config, err)
 	}
 }
 
@@ -224,6 +256,59 @@ func TestRunServesAndDrains(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("server did not drain")
+	}
+}
+
+type fakeDrainer struct {
+	draining bool
+}
+
+func (drainer *fakeDrainer) SetDraining(draining bool) {
+	drainer.draining = draining
+}
+
+type fakeHTTPShutdowner struct {
+	shutdown func(context.Context) error
+	close    func() error
+}
+
+func (server *fakeHTTPShutdowner) Shutdown(ctx context.Context) error { return server.shutdown(ctx) }
+func (server *fakeHTTPShutdowner) Close() error                       { return server.close() }
+
+func TestDrainHTTPOrdersShutdownBeforeClose(t *testing.T) {
+	drainer := &fakeDrainer{}
+	closed := false
+	server := &fakeHTTPShutdowner{
+		shutdown: func(context.Context) error {
+			if !drainer.draining || closed {
+				t.Fatalf("shutdown observed draining=%t closed=%t", drainer.draining, closed)
+			}
+			return nil
+		},
+		close: func() error {
+			closed = true
+			return nil
+		},
+	}
+	if err := drainHTTP(drainer, server, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if closed {
+		t.Fatal("forced close used after graceful shutdown")
+	}
+}
+
+func TestDrainHTTPForcesCloseAndPreservesErrors(t *testing.T) {
+	drainer := &fakeDrainer{}
+	shutdownErr := errors.New("shutdown failed")
+	closeErr := errors.New("close failed")
+	server := &fakeHTTPShutdowner{
+		shutdown: func(context.Context) error { return shutdownErr },
+		close:    func() error { return closeErr },
+	}
+	err := drainHTTP(drainer, server, time.Second)
+	if !drainer.draining || !errors.Is(err, shutdownErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("draining=%t error=%v", drainer.draining, err)
 	}
 }
 
