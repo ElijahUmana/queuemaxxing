@@ -16,7 +16,6 @@ A durable concurrent HTTP job queue with composable FIFO/LIFO ordering, signed p
 - [HTTP workflow](#http-workflow)
 - [Verification evidence](#verification-evidence)
 - [Assessment questions](#assessment-questions)
-- [Deployment boundary](#deployment-boundary)
 
 ## What it delivers
 
@@ -347,11 +346,3 @@ Its distinguishing strengths are:
 - **Operational fit:** offline, edge, on-premises, desktop-tool, CI-runner, and small-service environments where local ownership and a narrow operating surface matter.
 
 Choose Amazon SQS for AWS-managed availability and elastic service scale. Choose RabbitMQ for mature AMQP, exchanges, routing, plugins, and replicated broker topologies. Choose Apache Pulsar for partitioned multi-tenant retained streams, independent subscriptions, tiered storage, and geo-replication. Queuemaxxing is purpose-built for the single-node job-queue case where owning the complete persistence and delivery stack is an advantage.
-
-## Deployment boundary
-
-Queuemaxxing is a single-process, single-writer queue. It provides at-least-once delivery and local crash durability; it does not claim replication, automatic failover, host-loss survival, cross-region durability, or exactly-once downstream side effects.
-
-The API and Workbench bind to loopback by default and do not include native authentication, authorization, or TLS. Non-loopback deployment requires the explicit opt-in plus a trusted authenticated TLS reverse proxy and network policy.
-
-The local power-loss durability contract is asserted on Linux, macOS, DragonFly BSD, FreeBSD, NetBSD, and OpenBSD, where files and containing directories are synchronized. Windows synchronizes regular files, uses rooted rename, and holds the exclusive lock, but does not synchronize containing directories and therefore does not make the same power-loss claim. Network filesystems and external mutation of managed queue files are outside the supported storage boundary.
