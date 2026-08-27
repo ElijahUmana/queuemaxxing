@@ -13,4 +13,4 @@ COPY --from=build /out/qmax-workbench /usr/local/bin/qmax-workbench
 VOLUME ["/data"]
 EXPOSE 8080 8081
 ENTRYPOINT ["/usr/local/bin/qmax"]
-CMD ["serve", "--listen", "0.0.0.0:8080", "--data-dir", "/data"]
+CMD ["serve", "--listen", "0.0.0.0:8080", "--allow-non-loopback", "--data-dir", "/data"]

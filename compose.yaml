@@ -1,7 +1,7 @@
 services:
   queue:
     build: .
-    command: ["serve", "--listen", "0.0.0.0:8080", "--data-dir", "/data"]
+    command: ["serve", "--listen", "0.0.0.0:8080", "--allow-non-loopback", "--data-dir", "/data"]
     init: true
     read_only: true
     tmpfs:
@@ -21,7 +21,7 @@ services:
   workbench:
     build: .
     entrypoint: ["/usr/local/bin/qmax-workbench"]
-    command: ["--listen", "0.0.0.0:8081", "--api-url", "http://queue:8080"]
+    command: ["--listen", "0.0.0.0:8081", "--allow-non-loopback", "--api-url", "http://queue:8080"]
     init: true
     read_only: true
     depends_on:
