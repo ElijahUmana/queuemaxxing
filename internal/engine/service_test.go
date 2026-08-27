@@ -2681,6 +2681,97 @@ func TestStrictIdempotencyResultShapes(t *testing.T) {
 	}
 }
 
+func TestAdditionalRecoveryAndReplayFailuresFailClosed(t *testing.T) {
+	now := time.Date(2026, 8, 26, 20, 0, 0, 0, time.UTC)
+
+	t.Run("recovered-state-invariants", func(t *testing.T) {
+		fingerprint := strings.Repeat("a", sha256.Size*2)
+		result, err := json.Marshal(enqueueMutationResult{Message: cloneMessage(validRecoveredState(now).Queues["jobs"].Messages["ready"])})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cases := map[string]func(*persistedState){
+			"unsupported-version": func(state *persistedState) { state.Version = stateVersion + 1 },
+			"invalid-queue-name": func(state *persistedState) {
+				queue := state.Queues["jobs"]
+				delete(state.Queues, "jobs")
+				queue.Config.Name = "invalid/name"
+				state.Queues[queue.Config.Name] = queue
+			},
+			"lease-token-on-ready-message": func(state *persistedState) {
+				state.Queues["jobs"].Messages["ready"].LeaseToken = "unexpected"
+			},
+			"missing-acked-receipt": func(state *persistedState) {
+				delete(state.Queues["jobs"].AckedReceipts, "acked.1.abcdef0123456789abcdef0123456789")
+			},
+			"idempotency-unknown-queue": func(state *persistedState) {
+				record := idempotencyRecord{Operation: operationEnqueue, Queue: "missing", Key: "key", Fingerprint: fingerprint, Result: result, CreatedAt: now, ExpiresAt: now.Add(time.Hour), LastLSN: 4}
+				state.Idempotency[idempotencyID(record.Operation, record.Queue, record.Key)] = record
+			},
+		}
+		for name, mutate := range cases {
+			t.Run(name, func(t *testing.T) {
+				state, err := cloneStateForCheckpoint(validRecoveredState(now))
+				if err != nil {
+					t.Fatal(err)
+				}
+				mutate(&state)
+				if err := validatePersistedState(state, 4); err == nil {
+					t.Fatal("invalid recovered state accepted")
+				}
+			})
+		}
+	})
+
+	t.Run("malformed-envelopes", func(t *testing.T) {
+		service := &service{state: persistedState{Version: stateVersion, NextSequence: 1, Queues: map[string]*queueState{}, Idempotency: map[string]idempotencyRecord{}}}
+		for name, envelope := range map[string]json.RawMessage{
+			"state-structure": json.RawMessage(`{"kind":"state","version":1,"state":{},"delta":{}}`),
+			"state-json":      json.RawMessage(`{"kind":"state","version":1,"state":{"version":`),
+			"delta-structure": json.RawMessage(`{"kind":"delta","version":1,"state":{}}`),
+		} {
+			t.Run(name, func(t *testing.T) {
+				if err := service.applyEnvelope(envelope, 1); err == nil {
+					t.Fatal("malformed envelope accepted")
+				}
+			})
+		}
+	})
+
+	t.Run("invalid-delta-result", func(t *testing.T) {
+		state := validRecoveredState(now)
+		delta := stateDelta{AckedAt: map[string]map[string]*time.Time{"jobs": {"acked": nil}}}
+		if err := validateStateDelta(state, delta, 5); err == nil {
+			t.Fatal("delta that orphaned acknowledged state was accepted")
+		}
+	})
+
+	t.Run("corrupt-idempotency-result", func(t *testing.T) {
+		engine, _, _ := newTestService(t, model.FIFO, false, 3)
+		message := enqueueTest(t, engine, `{}`, 0, 0, "message")
+		id := idempotencyID(operationEnqueue, "jobs", "message")
+		engine.mu.Lock()
+		record := engine.state.Idempotency[id]
+		record.Result = json.RawMessage(`{"message":`)
+		engine.state.Idempotency[id] = record
+		engine.mu.Unlock()
+		_, _, err := engine.Enqueue(context.Background(), "jobs", model.EnqueueRequest{Payload: message.Payload, IdempotencyKey: "message"})
+		if !IsCode(err, CodeStorageUnavailable) {
+			t.Fatalf("corrupt replay result error = %v", err)
+		}
+	})
+
+	t.Run("serialization-errors", func(t *testing.T) {
+		if _, err := fingerprint(make(chan int)); err == nil {
+			t.Fatal("unsupported fingerprint value serialized")
+		}
+		service := &service{clock: newFakeClock(now), limits: DefaultLimits(), state: persistedState{Idempotency: map[string]idempotencyRecord{}}}
+		if err := service.saveIdempotencyLocked(operationEnqueue, "jobs", "key", "fingerprint", make(chan int)); err == nil {
+			t.Fatal("unsupported idempotency result serialized")
+		}
+	})
+}
+
 func TestPersistedZeroSequenceFailsClosed(t *testing.T) {
 	state := validRecoveredState(time.Date(2026, 8, 26, 20, 0, 0, 0, time.UTC))
 	state.NextSequence = 0
@@ -2853,6 +2944,94 @@ func TestMutationCoordinatorInternalFailureBranchesRollback(t *testing.T) {
 			t.Fatalf("oversized result = %+v", result)
 		}
 	})
+}
+
+func TestMutationDrainBatchLimitAndEncodedByteSplit(t *testing.T) {
+	t.Run("drain-full-batch", func(t *testing.T) {
+		engine, _, _ := newTestService(t, model.FIFO, false, 3)
+		if err := engine.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		requests := make([]mutationRequest, maxMutationBatch)
+		for index := range requests {
+			requests[index] = mutationRequest{
+				ctx:       context.Background(),
+				queueName: "jobs",
+				result:    make(chan mutationResult, 1),
+				mutation:  func() error { return nil },
+			}
+			engine.mutationCh <- requests[index]
+		}
+		engine.drainMutationRequests()
+		for index := range requests {
+			if result := <-requests[index].result; result.err != nil {
+				t.Fatalf("request %d = %+v", index, result)
+			}
+		}
+	})
+
+	t.Run("encoded-byte-split", func(t *testing.T) {
+		engine, store, _ := newTestService(t, model.FIFO, false, 3)
+		store.mu.Lock()
+		batchCallsBefore := store.batchCalls
+		store.mu.Unlock()
+		payload := json.RawMessage(`"` + strings.Repeat("x", maxMutationBatchBytes/2) + `"`)
+		requests := make([]mutationRequest, 2)
+		for index := range requests {
+			id := fmt.Sprintf("large-%d", index)
+			requests[index] = mutationRequest{
+				ctx:       context.Background(),
+				queueName: "jobs",
+				result:    make(chan mutationResult, 1),
+				mutation: func() error {
+					message := &model.Message{ID: id, Queue: "jobs", Payload: payload, Sequence: engine.state.NextSequence}
+					engine.state.NextSequence++
+					engine.state.Queues["jobs"].Messages[id] = message
+					engine.totalMessages++
+					return nil
+				},
+			}
+		}
+		engine.processMutationRequests(requests)
+		for index := range requests {
+			if result := <-requests[index].result; result.err != nil {
+				t.Fatalf("request %d = %+v", index, result)
+			}
+		}
+		store.mu.Lock()
+		batchCalls := store.batchCalls - batchCallsBefore
+		batchSizes := append([]int(nil), store.batchSizes[len(store.batchSizes)-batchCalls:]...)
+		store.mu.Unlock()
+		if batchCalls != 2 || !reflect.DeepEqual(batchSizes, []int{1, 1}) {
+			t.Fatalf("encoded byte split = calls %d sizes %v", batchCalls, batchSizes)
+		}
+	})
+}
+
+func TestDirectIdempotencyLoadBranches(t *testing.T) {
+	engine, _, _ := newTestService(t, model.FIFO, false, 3)
+	ctx := context.Background()
+	request := model.ReceiveRequest{IdempotencyKey: "empty-direct"}
+	requestFingerprint, err := fingerprint(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if delivery, replayed, err := engine.finishEmptyReceive(ctx, "jobs", request, requestFingerprint); err != nil || delivery != nil || replayed {
+		t.Fatalf("initial empty receive = %+v/%t, %v", delivery, replayed, err)
+	}
+	if delivery, replayed, err := engine.finishEmptyReceive(ctx, "jobs", request, requestFingerprint); err != nil || delivery != nil || !replayed {
+		t.Fatalf("empty receive replay = %+v/%t, %v", delivery, replayed, err)
+	}
+
+	message := enqueueTest(t, engine, `{}`, 0, 0, "ack-message")
+	delivery := receiveTest(t, engine, "ack-receive")
+	ack := model.AckRequest{MessageID: message.ID, Receipt: delivery.Receipt, IdempotencyKey: "ack-key"}
+	if replayed, err := engine.Ack(ctx, "jobs", ack); err != nil || replayed {
+		t.Fatalf("initial ack = %t, %v", replayed, err)
+	}
+	if replayed, err := engine.Ack(ctx, "jobs", ack); err != nil || !replayed {
+		t.Fatalf("ack replay = %t, %v", replayed, err)
+	}
 }
 
 func TestRemainingEngineErrorAndStateBranches(t *testing.T) {
